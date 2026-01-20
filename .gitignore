@@ -7,3 +7,6 @@ Level.sav.json
 
 character*.json
 *.user
+
+savereader/
+solver/
