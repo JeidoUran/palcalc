@@ -10,3 +10,8 @@ character*.json
 
 savereader/
 solver/
+owned.json
+debug.txt
+dump.log
+
+localization.fr.json
