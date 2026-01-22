@@ -111,12 +111,26 @@ internal static class SolverMapping
         return result;
     }
 
-    private static PalGender ParseGender(string? g)
+    static PalGender ParseGender(string? raw)
     {
-        if (string.IsNullOrWhiteSpace(g)) return PalGender.WILDCARD;
-        if (g.Contains("::Male", StringComparison.OrdinalIgnoreCase)) return PalGender.MALE;
-        if (g.Contains("::Female", StringComparison.OrdinalIgnoreCase)) return PalGender.FEMALE;
-        return PalGender.WILDCARD;
+        if (string.IsNullOrWhiteSpace(raw))
+            return PalGender.WILDCARD; // ou NONE, mais WILDCARD est souvent “moins dangereux” côté algo
+
+        raw = raw.Trim();
+
+        // Format ancien: "(EPalGenderType)EPalGenderType::Female"
+        if (raw.Contains("Female", StringComparison.OrdinalIgnoreCase)) return PalGender.FEMALE;
+        if (raw.Contains("Male", StringComparison.OrdinalIgnoreCase)) return PalGender.MALE;
+
+        // Format nouveau: "FEMALE" / "MALE"
+        if (raw.Equals("FEMALE", StringComparison.OrdinalIgnoreCase)) return PalGender.FEMALE;
+        if (raw.Equals("MALE", StringComparison.OrdinalIgnoreCase)) return PalGender.MALE;
+
+        // parfois "EPalGenderType::Female" ou juste "Female"
+        if (raw.Equals("Female", StringComparison.OrdinalIgnoreCase)) return PalGender.FEMALE;
+        if (raw.Equals("Male", StringComparison.OrdinalIgnoreCase)) return PalGender.MALE;
+
+        return PalGender.WILDCARD; // fallback safe
     }
 
     private static PalLocation CreateLocation(string? containerKind, string? containerId, int? slotIndex)

@@ -101,37 +101,43 @@ namespace PalCalc.Solver
                 .Select(g => g.ToList())
                 .SelectMany<List<OwnedPalReference>, IPalReference>(g =>
                 {
-                    // only one pal in this group, cant turn into a composite, keep as-is
-                    if (g.Count == 1) return g;
+                    // 0/1 -> rien à combiner
+                    if (g.Count <= 1) return g;
 
-                    // shouldn't happen, at this point groups should have at most one male and at most one female
-                    if (g.Count != 2) throw new NotImplementedException();
+                    // On ne devrait avoir que {1 male, 1 female}, mais on rend robuste.
+                    // S'il y a plusieurs males/females, on prend le "meilleur" de chaque côté.
+                    OwnedPalReference? BestOf(IEnumerable<OwnedPalReference> xs) =>
+                        xs
+                            .OrderBy(p => p.ActualPassives.Count)
+                            .ThenBy(p => PreferredLocationPruning.LocationOrderingOf(p.UnderlyingInstance.Location.Type))
+                            .ThenByDescending(p => p.UnderlyingInstance.IV_HP + p.UnderlyingInstance.IV_Attack + p.UnderlyingInstance.IV_Defense)
+                            .FirstOrDefault();
 
-                    var malePal = g.SingleOrDefault(p => p.Gender == PalGender.MALE);
-                    var femalePal = g.SingleOrDefault(p => p.Gender == PalGender.FEMALE);
+                    var males = g.Where(p => p.Gender == PalGender.MALE).ToList();
+                    var females = g.Where(p => p.Gender == PalGender.FEMALE).ToList();
+
+                    var malePal = BestOf(males);
+                    var femalePal = BestOf(females);
+
+                    // Si on n'a pas un couple M/F, impossible de faire un composite : on garde juste les meilleurs (ou tout si tu préfères)
+                    if (malePal == null || femalePal == null)
+                    {
+                        // Option conservatrice : garder un seul "meilleur" pal de ce groupe
+                        var bestAny = BestOf(g);
+                        return bestAny != null ? new IPalReference[] { bestAny } : Array.Empty<IPalReference>();
+                        // (Si tu préfères: return g; pour tout garder)
+                    }
+
                     var composite = new CompositeOwnedPalReference(malePal, femalePal);
 
-                    // the pals are practically the same aside from gender, i.e. they satisfy all the same requirements, but they could
-                    // still have different numbers of irrelevant passives.
-                    //
-                    // if they're *really* the same in all aspects, we can just merge them, otherwise we can merge but
-                    // should still keep track of the original pals
-
-                    // (note - these pals weren't combined in earlier groupings since PalProperty.RelevantPassives is intentionally used
-                    //         instead of EffectivePassives or ActualPassives)
+                    // Si "effectivement" identiques pour le solve, on peut ne garder que le composite.
                     if (malePal.EffectivePassivesHash == femalePal.EffectivePassivesHash)
-                    {
-                        return [composite];
-                    }
-                    else
-                    {
-                        return [
-                            malePal,
-                            femalePal,
-                            composite
-                        ];
-                    }
+                        return new IPalReference[] { composite };
+
+                    // Sinon on garde les deux + composite
+                    return new IPalReference[] { malePal, femalePal, composite };
                 })
+
                 .ToList();
 
             if (settings.MaxWildPals > 0)

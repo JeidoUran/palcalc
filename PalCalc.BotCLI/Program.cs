@@ -1144,9 +1144,18 @@ Examples:
         var pruned = pruner.Apply(results, cached).ToList();
 
         Console.WriteLine($"Found {results.Count} solutions (raw)");
-        Console.WriteLine($"Found {pruned.Count} solutions (pruned)");
 
-        Console.WriteLine($"Found {results.Count} solutions");
+        foreach (var r in results
+            .OrderBy(x => x.NumTotalEggs)
+            .ThenBy(x => x.NumTotalBreedingSteps)
+            .ThenBy(x => x.BreedingEffort)
+            .Take(10))
+        {
+            Console.WriteLine();
+            BreedingPlanRenderer.Print((IPalReference)r);
+        }
+
+        Console.WriteLine($"Found {pruned.Count} solutions (pruned)");
 
         if (pruned.Count > 0)
 

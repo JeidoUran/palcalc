@@ -8,9 +8,24 @@ public static class BreedingPlanRenderer
         switch (r)
         {
             case OwnedPalReference o:
+            {
                 Console.WriteLine($"{indent}- OWNED {o.Pal.Name} {o.Gender} [{FormatPalLocation(o.UnderlyingInstance.Location)}]");
-                Console.WriteLine($"{indent}    eff : {(o.EffectivePassives.Count == 0 ? "no passives" : string.Join(", ", o.EffectivePassives.Select(p => p.Name)))}");
+
+                var eff = (o.EffectivePassives.Count == 0)
+                    ? "no passives"
+                    : string.Join(", ", o.EffectivePassives.Select(p => p.Name));
+
+                // Actual passives = ceux du PalInstance (les "vrais")
+                var actualList = o.ActualPassives ?? o.UnderlyingInstance?.PassiveSkills;
+                var actual = (actualList == null || actualList.Count == 0)
+                    ? "no passives"
+                    : string.Join(", ", actualList.Select(p => p.Name));
+
+                Console.WriteLine($"{indent}    eff    : {eff}");
+                Console.WriteLine($"{indent}    actual : {actual}");
+
                 return;
+            }
 
             case BredPalReference b:
                 Console.WriteLine($"{indent}- BRED {b.Pal.Name} {b.Gender} steps={b.NumTotalBreedingSteps} eggs~{b.AvgRequiredBreedings} totalEggs~{b.NumTotalEggs}");
