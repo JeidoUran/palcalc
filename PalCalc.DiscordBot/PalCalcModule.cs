@@ -11,6 +11,8 @@ using PalCalc.Solver;
 using PalCalc.Solver.PalReference;
 using PalCalc.Solver.ResultPruning;
 
+using System.Text.Json;
+
 namespace PalCalc.DiscordBot;
 
 public enum TargetGender
@@ -25,12 +27,20 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
     private readonly IConfiguration _cfg;
     private readonly ILogger<PalCalcModule> _log;
     private readonly PlayerIndexService _players;
-
-    public PalCalcModule(IConfiguration cfg, ILogger<PalCalcModule> log, PlayerIndexService players)
+    private readonly EmojiRegistry _emojis;
+    private readonly PassiveIndexService _passives;
+    public PalCalcModule(
+        IConfiguration cfg,
+        ILogger<PalCalcModule> log,
+        PlayerIndexService players,
+        PassiveIndexService passives,
+        EmojiRegistry emojis)
     {
         _cfg = cfg;
         _log = log;
         _players = players;
+        _passives = passives;
+        _emojis = emojis;
     }
 
     [SlashCommand("palcalc", "Trouve des solutions de breeding à partir des données du serveur")]
@@ -111,14 +121,28 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 .Where(ps => !string.IsNullOrWhiteSpace(ps.InternalName))
                 .ToDictionary(ps => ps.InternalName!, StringComparer.OrdinalIgnoreCase);
 
+            _passives.TryRefreshIfStale();
+            var passiveIdByFrName = _passives.GetCachedFast()
+                .GroupBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.OrdinalIgnoreCase);
+
+
             var requiredPassives = new List<PassiveSkill>();
-            foreach (var id in requiredPassiveIds)
+
+            foreach (var raw in requiredPassiveIds)
             {
-                if (passivesByInternal.TryGetValue(id, out var ps))
+                // raw peut être InternalName (OK) OU label FR (selon ce que Discord renvoie)
+                var key = raw;
+
+                if (!passivesByInternal.ContainsKey(key) && passiveIdByFrName.TryGetValue(key, out var mapped))
+                    key = mapped;
+
+                if (passivesByInternal.TryGetValue(key, out var ps))
                     requiredPassives.Add(ps);
                 else
-                    _log.LogWarning("Unknown passive internalName: {Passive}", id);
+                    _log.LogWarning("Unknown passive: {Passive}", raw);
             }
+
 
             var requiredGender = target_gender switch
             {
@@ -173,7 +197,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             {
                 var text = RenderPlan(top[i], $"Solution #{i + 1}");
                 foreach (var chunk in ChunkForDiscord(text, 1900))
-                    await FollowupAsync($"```md\n{chunk}\n```");
+                    await FollowupAsync(chunk);
+
             }
         }
         catch (Exception ex)
@@ -368,7 +393,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             .Build();
     }
 
-    private static string RenderPlan(object plan, string title)
+    private string RenderPlan(object plan, string title)
     {
         // 1) Capture output brut
         var raw = CaptureBreedingRenderer(plan);
@@ -378,7 +403,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
         // 3) Header + body
         var sb = new StringBuilder();
-        sb.AppendLine($"✨ {title}");
+        sb.AppendLine($"<:egg:1464196335430402122> {title}");
         sb.AppendLine();
         sb.AppendLine(pretty);
 
@@ -404,7 +429,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         }
     }
 
-    private static string PrettyFormatBreedingPlan(string raw)
+    private string PrettyFormatBreedingPlan(string raw)
     {
         // Normalize lines
         var lines = raw.Replace("\r\n", "\n")
@@ -413,10 +438,24 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                       .Where(l => !string.IsNullOrWhiteSpace(l))
                       .ToList();
 
+        _passives.TryRefreshIfStale();
+
+        // 1) dictionnaire clé interne -> FR depuis ton JSON (la vraie source)
+        var frByInternal = LoadPassiveLocFr();
+
+        // 2) dictionnaire nom anglais lisible -> clé interne, via PalDB
+        // (cache simple par appel; si tu veux optimiser, on le met en champ plus tard)
+        var db = PalDB.LoadEmbedded();
+        var internalByEnglish = BuildInternalByEnglishName(db);
+
         // On va reconstruire un arbre “à l’ancienne” en suivant l’indentation (les lignes ont souvent des espaces)
         // Mais ici on prend une approche simple: on utilise les préfixes connus.
 
         var sb = new StringBuilder();
+
+        const int INDENT_RESULT = 0;   // Pal final
+        const int INDENT_OWNED  = 2;   // Pal possédé
+        const int INDENT_PASSIVE = 4;  // Passifs d’un Pal
 
         int indent = 0;
         void Line(string s, int extraIndent = 0)
@@ -440,7 +479,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (t.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
             {
                 var info = ParseBredLine(t);
-
+                var palEmoji = EmojiForPal(info.palName);
                 // Un BRED peut être la cible finale OU une sous-étape.
                 // On met un header d’étape si totalEggs/eggs présents.
                 var eggsTxt = info.eggs.HasValue ? $"{info.eggs.Value}🥚" : "—";
@@ -450,8 +489,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 // Si c’est le premier BRED, on le traite comme résultat final
                 if (currentStepHeader == null)
                 {
-                    Line($"🎯 **{info.palName}** {FormatGender(info.gender)}{stepsTxt} • {eggsTxt}{totalTxt}");
-                    indent = 1;
+                    Line($"{palEmoji} **{info.palName}** {FormatGender(info.gender)}{stepsTxt} • {eggsTxt}{totalTxt}", INDENT_RESULT);
                     currentStepHeader = info.palName;
                 }
                 else
@@ -468,8 +506,13 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (t.StartsWith("- OWNED ", StringComparison.OrdinalIgnoreCase))
             {
                 var owned = ParseOwnedLine(t);
-                Line($"📦 **{owned.palName}** {FormatGender(owned.gender)}{(string.IsNullOrWhiteSpace(owned.location) ? "" : $" — `{owned.location}`")}");
-                indent = 3; // ensuite "eff/actual" et passives seront sous ce bloc
+                var palEmoji = EmojiForPal(owned.palName);
+
+                Line(
+                    $"{palEmoji} **{owned.palName}** {FormatGender(owned.gender)}" +
+                    $"{(string.IsNullOrWhiteSpace(owned.location) ? "" : $" — `{owned.location}`")}",
+                    INDENT_OWNED
+                );
                 continue;
             }
 
@@ -478,25 +521,37 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (t.StartsWith("passives:", StringComparison.OrdinalIgnoreCase))
             {
                 var pass = t.Substring("passives:".Length).Trim();
-                pass = pass.Replace("(Random)", "🎲 aléatoire", StringComparison.OrdinalIgnoreCase);
-                Line($"🧬 Passifs attendus : **{pass}**", extraIndent: 0);
+
+                // Découpe "A, B, (Random)" -> tokens
+                var tokens = pass.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(x => x.Trim())
+                                .Select(x => LocalizePassiveToken(x, frByInternal, internalByEnglish))
+                                .ToList();
+
+                Line($"🧬 Passifs attendus : **{string.Join(", ", tokens)}**", extraIndent: 0);
                 continue;
             }
 
             // eff / actual
+            // eff / héritage → volontairement ignoré pour lisibilité
             if (t.StartsWith("eff", StringComparison.OrdinalIgnoreCase))
-            {
-                // "eff : Demon God"
-                var val = t.Split(':', 2).LastOrDefault()?.Trim() ?? t;
-                Line($"➡️ Hérite : **{val}**", extraIndent: 0);
                 continue;
-            }
 
             if (t.StartsWith("actual", StringComparison.OrdinalIgnoreCase))
             {
                 // "actual : Demon God"
                 var val = t.Split(':', 2).LastOrDefault()?.Trim() ?? t;
-                Line($"✅ Réel : **{val}**", extraIndent: 0);
+
+                var tokens = val.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(x => x.Trim())
+                                .Select(x => LocalizePassiveToken(x, frByInternal, internalByEnglish))
+                                .ToList();
+
+                Line(
+                    $"{EmojiReal()} Passifs : **{string.Join(", ", tokens)}**",
+                    INDENT_PASSIVE
+                );
+
                 continue;
             }
 
@@ -638,4 +693,88 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (bad.Contains(arr[i])) arr[i] = '_';
         return new string(arr);
     }
+
+    private string EmojiForPal(string palLocalizedName)
+    {
+        var key = EmojiNameNormalizer.Normalize(palLocalizedName);
+        return _emojis.TryGet(key) ?? "";
+    }
+
+    private string EmojiReal() => _emojis.TryGet("passive_rank_arrow_03") ?? "";
+    private string EmojiInherit() => _emojis.TryGet("passive_rank_arrow_04") ?? "";
+
+    private string LocalizePassiveToken(
+        string token,
+        Dictionary<string, string> frByInternal,
+        Dictionary<string, string> internalByEnglish)
+    {
+        token = token.Trim();
+
+        if (token.Equals("(Random)", StringComparison.OrdinalIgnoreCase))
+            return "🎲 aléatoire";
+
+        // 1) si c'est déjà une clé interne (ex: Nocturnal, PAL_ALLAttack_up3)
+        if (frByInternal.TryGetValue(token, out var fr1))
+            return fr1;
+
+        // 2) si c'est un nom anglais lisible (ex: "Diamond Body")
+        if (internalByEnglish.TryGetValue(token, out var internalKey) &&
+            frByInternal.TryGetValue(internalKey, out var fr2))
+            return fr2;
+
+        return token;
+    }
+    private Dictionary<string, string> LoadPassiveLocFr()
+    {
+        var path = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
+
+        try
+        {
+            var json = File.ReadAllText(path, Encoding.UTF8);
+            using var doc = JsonDocument.Parse(json);
+
+            if (!doc.RootElement.TryGetProperty("passives", out var passivesEl) ||
+                passivesEl.ValueKind != JsonValueKind.Object)
+                return new(StringComparer.OrdinalIgnoreCase);
+
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var prop in passivesEl.EnumerateObject())
+            {
+                var key = prop.Name;
+                var val = prop.Value.GetString();
+                if (!string.IsNullOrWhiteSpace(key) && !string.IsNullOrWhiteSpace(val))
+                    dict[key] = val.Trim();
+            }
+            return dict;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Failed to load passives localization from {Path}", path);
+            return new(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private Dictionary<string, string> BuildInternalByEnglishName(PalDB db)
+    {
+        // map "Diamond Body" (anglais) -> "Deffence_up3" (internal key)
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var ps in db.PassiveSkills)
+        {
+            if (string.IsNullOrWhiteSpace(ps.InternalName))
+                continue;
+
+            // Selon les versions de PalDB, le champ "Name" peut être l'anglais lisible
+            var en = (ps.Name ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(en))
+                continue;
+
+            // si doublon, on garde le premier (ça suffit)
+            if (!dict.ContainsKey(en))
+                dict[en] = ps.InternalName!;
+        }
+
+        return dict;
+    }
+
 }

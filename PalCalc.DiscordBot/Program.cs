@@ -31,7 +31,9 @@ public class Program
             {
                 services.AddSingleton(new DiscordSocketConfig
                 {
-                    GatewayIntents = GatewayIntents.Guilds,
+                    GatewayIntents =
+                        GatewayIntents.Guilds |
+                        GatewayIntents.GuildEmojis,
                     AlwaysDownloadUsers = false,
                     LogGatewayIntentWarnings = false,
                 });
@@ -39,6 +41,7 @@ public class Program
                 services.AddSingleton<PlayerIndexService>();
                 services.AddSingleton<PalIndexService>();
                 services.AddSingleton<PassiveIndexService>();
+                services.AddSingleton<EmojiRegistry>();
                 services.AddSingleton<DiscordSocketClient>();
                 services.AddSingleton(x => new InteractionService(x.GetRequiredService<DiscordSocketClient>()));
                 services.AddSingleton<InteractionHandler>();
@@ -80,6 +83,7 @@ public sealed class InteractionHandler
     private readonly PlayerIndexService _players;
     private readonly PalIndexService _pals;
     private readonly PassiveIndexService _passives;
+    private readonly EmojiRegistry _emojis;
     public InteractionHandler(
         DiscordSocketClient client,
         InteractionService interactions,
@@ -88,7 +92,8 @@ public sealed class InteractionHandler
         IConfiguration cfg,
         PlayerIndexService players,
         PalIndexService pals,
-        PassiveIndexService passives)
+        PassiveIndexService passives,
+        EmojiRegistry emojis)
     {
         _client = client;
         _interactions = interactions;
@@ -98,6 +103,7 @@ public sealed class InteractionHandler
         _players = players;
         _pals = pals;
         _passives = passives;
+        _emojis = emojis;
     }
 
     public async Task InitializeAsync()
@@ -122,6 +128,7 @@ public sealed class InteractionHandler
         await _interactions.AddModulesAsync(Assembly.GetExecutingAssembly(), _services);
 
         var token = _cfg["Discord:Token"];
+
         if (string.IsNullOrWhiteSpace(token))
             throw new InvalidOperationException("Missing Discord:Token. Put it in appsettings.json or PALCALC_Discord__Token env var.");
 
@@ -131,15 +138,33 @@ public sealed class InteractionHandler
 
     private async Task OnReadyAsync()
     {
-
+        var token = _cfg["Discord:Token"];
+        var appIdStr = _cfg["Discord:ApplicationId"];
         var guildIdStr = _cfg["Discord:GuildId"];
-        if (ulong.TryParse(guildIdStr, out var guildId) && guildId != 0)
+        if (ulong.TryParse(guildIdStr, out var guildId) && ulong.TryParse(appIdStr, out var appId) && !string.IsNullOrWhiteSpace(token))
         {
             await _interactions.RegisterCommandsToGuildAsync(guildId);
             _log.LogInformation("Slash commands registered to guild {GuildId}", guildId);
+            var guild = _client.GetGuild(guildId);
+
+            try
+            {
+                var items = await ApplicationEmojiLoader.LoadAsync(token, appId);
+                _emojis.LoadMentions(items);
+                _log.LogInformation("Application emoji registry loaded: {Count}", _emojis.Count);
+                _log.LogInformation("egg={Egg} xenolord={Xeno}",
+                    _emojis.TryGet("egg") ?? "NULL",
+                    _emojis.TryGet("xenolord") ?? "NULL");
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Failed to load application emojis");
+            }
+
         }
         else
         {
+            _log.LogWarning("No Discord:GuildId set, emoji registry not loaded.");
             await _interactions.RegisterCommandsGloballyAsync();
             _log.LogInformation("Slash commands registered globally");
         }
@@ -148,6 +173,7 @@ public sealed class InteractionHandler
         _players.TryRefreshIfStale();
         _pals.TryRefreshIfStale();
         _passives.TryRefreshIfStale();
+
     }
 
     private async Task OnInteractionAsync(SocketInteraction interaction)

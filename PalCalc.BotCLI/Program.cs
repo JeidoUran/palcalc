@@ -1168,29 +1168,6 @@ Examples:
         return settings;
     }
 
-
-    static int TryGetCount(object? enumerable)
-    {
-        if (enumerable == null) return 0;
-        if (enumerable is System.Collections.ICollection c) return c.Count;
-
-        // fallback: enumerate
-        int n = 0;
-        if (enumerable is System.Collections.IEnumerable e)
-            foreach (var _ in e) n++;
-        return n;
-    }
-
-    static object? TryGetFirst(object? enumerable)
-    {
-        if (enumerable is System.Collections.IEnumerable e)
-        {
-            foreach (var x in e) return x;
-        }
-        return null;
-    }
-
-
     static void DebugModel()
     {
         Console.WriteLine("=== Forcing load of PalCalc.Solver assemblies ===");
