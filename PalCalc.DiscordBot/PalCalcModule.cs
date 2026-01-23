@@ -1,8 +1,11 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
+using System.Text.Json;
 
 using Discord;
 using Discord.Interactions;
+
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -10,8 +13,6 @@ using PalCalc.Model;
 using PalCalc.Solver;
 using PalCalc.Solver.PalReference;
 using PalCalc.Solver.ResultPruning;
-
-using System.Text.Json;
 
 namespace PalCalc.DiscordBot;
 
@@ -482,14 +483,16 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 var palEmoji = EmojiForPal(info.palName);
                 // Un BRED peut être la cible finale OU une sous-étape.
                 // On met un header d’étape si totalEggs/eggs présents.
-                var eggsTxt = info.eggs.HasValue ? $"{info.eggs.Value}🥚" : "—";
-                var totalTxt = info.totalEggs.HasValue ? $" (total {info.totalEggs.Value}🥚)" : "";
+                var eggsTxt = info.eggs.HasValue ? $"~{info.eggs.Value}<:egg:1464196335430402122>" : null;
+                var totalTxt = info.totalEggs.HasValue ? $" (total ~{info.totalEggs.Value}<:egg:1464196335430402122>)" : null;
                 var stepsTxt = info.steps.HasValue ? $" • {info.steps.Value} étape(s)" : "";
 
                 // Si c’est le premier BRED, on le traite comme résultat final
                 if (currentStepHeader == null)
                 {
-                    Line($"{palEmoji} **{info.palName}** {FormatGender(info.gender)}{stepsTxt} • {eggsTxt}{totalTxt}", INDENT_RESULT);
+                    var eggPart = eggsTxt != null ? $" • {eggsTxt}" : "";
+                    var totalPart = totalTxt ?? "";
+                    Line($"{palEmoji} **{info.palName}** {FormatGender(info.gender)}{stepsTxt}{eggPart}{totalPart}", INDENT_RESULT);
                     currentStepHeader = info.palName;
                 }
                 else
@@ -508,11 +511,11 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 var owned = ParseOwnedLine(t);
                 var palEmoji = EmojiForPal(owned.palName);
 
-                Line(
-                    $"{palEmoji} **{owned.palName}** {FormatGender(owned.gender)}" +
-                    $"{(string.IsNullOrWhiteSpace(owned.location) ? "" : $" — `{owned.location}`")}",
-                    INDENT_OWNED
-                );
+                var loc = LocalizeLocation(owned.location);
+
+                Line($"{palEmoji} **{owned.palName}** {FormatGender(owned.gender)}{(string.IsNullOrWhiteSpace(loc) ? "" : $" — `{loc}`")}",
+                    INDENT_OWNED);
+
                 continue;
             }
 
@@ -584,9 +587,9 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         // "- BRED <name> <gender> steps=3 eggs=3 totalEggs=14"
         var t = line.Substring("- BRED ".Length).Trim();
 
-        int? steps = TryParseIntAfter(t, "steps=");
-        int? eggs = TryParseIntAfter(t, "eggs=");
-        int? total = TryParseIntAfter(t, "totalEggs=");
+        int? eggs = TryParseIntAfter(t, "eggs");
+        int? total = TryParseIntAfter(t, "totalEggs");
+        int? steps = TryParseIntAfter(t, "steps");
 
         // gender est souvent le dernier token "MALE/FEMALE/WILDCARD/OPPOSITE_WILDCARD"
         // on coupe avant "steps="
@@ -647,9 +650,15 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private static int? TryParseIntAfter(string text, string key)
     {
+        // accepte "key=123" OU "key~123"
         var i = text.IndexOf(key, StringComparison.OrdinalIgnoreCase);
         if (i < 0) return null;
         i += key.Length;
+
+        if (i >= text.Length) return null;
+
+        // saute '=' ou '~' ou ':' si jamais
+        if (text[i] is '=' or '~' or ':') i++;
 
         int j = i;
         while (j < text.Length && char.IsDigit(text[j])) j++;
@@ -775,6 +784,37 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         }
 
         return dict;
+    }
+
+    private string LocalizeLocation(string? location)
+    {
+        if (string.IsNullOrWhiteSpace(location))
+            return "";
+
+        var s = location.Trim();
+
+        // Le renderer peut te sortir "DimensionalPalStorage ..."
+        s = s.Replace("DimensionalPalStorage", "Stockage de Pals dimensionnel", StringComparison.OrdinalIgnoreCase);
+
+        // Le JSON peut avoir "Dimensional Pal Storage (Selene), ..."
+        s = s.Replace("Dimensional Pal Storage", "Stockage de Pals dimensionnel", StringComparison.OrdinalIgnoreCase);
+
+        s = s.Replace("GlobalPalBox", "Boîte à Pals globale", StringComparison.OrdinalIgnoreCase);
+
+        s = s.Replace("Party", "Équipe", StringComparison.OrdinalIgnoreCase);
+
+        // Si jamais t’as encore des vieux tokens qui pop (optionnel)
+        s = s.Replace("Palbox", "Boîte à Pals", StringComparison.OrdinalIgnoreCase);
+        s = s.Replace("MarketStall", "Marché aux puces", StringComparison.OrdinalIgnoreCase);
+
+        s = Regex.Replace(
+            s,
+            @"\s+Onglet\s+",
+            ", Onglet ",
+            RegexOptions.IgnoreCase
+        );
+
+        return s;
     }
 
 }
