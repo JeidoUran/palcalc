@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using System.Collections.Concurrent;
 
 using Discord;
 using Discord.Interactions;
@@ -30,6 +31,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
     private readonly PlayerIndexService _players;
     private readonly EmojiRegistry _emojis;
     private readonly PassiveIndexService _passives;
+
     public PalCalcModule(
         IConfiguration cfg,
         ILogger<PalCalcModule> log,
@@ -127,7 +129,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 .GroupBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.OrdinalIgnoreCase);
 
-
             var requiredPassives = new List<PassiveSkill>();
 
             foreach (var raw in requiredPassiveIds)
@@ -143,7 +144,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 else
                     _log.LogWarning("Unknown passive: {Passive}", raw);
             }
-
 
             var requiredGender = target_gender switch
             {
@@ -177,7 +177,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             var cached = new CachedResultData(results);
             var pruned = pruner.Apply(results, cached).ToList();
 
-            // 6) Render (top 3) en code blocks (Discord 2000 chars)
+            // 6) Render
             var header = BuildHeader(playerName, target, target_gender, requiredPassiveIds, iv_hp, iv_atk, iv_def, ownedInstances.Count, results.Count, pruned.Count);
             await FollowupAsync(embed: header);
 
@@ -187,20 +187,67 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 return;
             }
 
-            var top = pruned
+            var bestPruned = pruned
                 .OrderBy(x => x.NumTotalEggs)
                 .ThenBy(x => x.NumTotalBreedingSteps)
                 .ThenBy(x => x.BreedingEffort)
-                .Take(3)
+                .FirstOrDefault();
+
+            var rawTop = results
+                .OrderBy(x => x.NumTotalEggs)
+                .ThenBy(x => x.NumTotalBreedingSteps)
+                .ThenBy(x => x.BreedingEffort)
+                .Take(30)
                 .ToList();
 
-            for (int i = 0; i < top.Count; i++)
-            {
-                var text = RenderPlan(top[i], $"Solution #{i + 1}");
-                foreach (var chunk in ChunkForDiscord(text, 1900))
-                    await FollowupAsync(chunk);
+            var pages = new List<string>();
 
+            if (bestPruned != null)
+                pages.Add(RenderPlan(bestPruned, "Solution #1 (prunée)"));
+
+            int addedRaw = 0;
+            foreach (var r in rawTop)
+            {
+                if (addedRaw >= 9) break;
+                if (bestPruned != null && ReferenceEquals(r, bestPruned))
+                    continue;
+
+                pages.Add(RenderPlan(r, $"Solution #{pages.Count + 1} (raw)"));
+                addedRaw++;
             }
+
+            if (pages.Count == 0 && results.Count > 0)
+                pages.Add(RenderPlan(results[0], "Solution #1 (raw)"));
+
+            var session = new PagerSession
+            {
+                OwnerUserId = Context.User.Id,
+                ChannelId = Context.Channel.Id,
+                Header = header,
+                Pages = pages,
+                Index = 0
+            };
+
+            var firstSolution = BuildSolutionEmbed(session);
+            var msg = await FollowupAsync(
+                embeds: new[] { session.Header, firstSolution },
+                components: BuildPagerComponents("TEMP")
+            );
+
+            var pagerKey = msg.Id.ToString();
+
+            session = new PagerSession
+            {
+                OwnerUserId = session.OwnerUserId,
+                ChannelId = session.ChannelId,
+                MessageId = msg.Id,
+                Header = session.Header,
+                Pages = session.Pages,
+                Index = session.Index
+            };
+
+            _pager[pagerKey] = session;
+            await msg.ModifyAsync(m => m.Components = BuildPagerComponents(pagerKey));
         }
         catch (Exception ex)
         {
@@ -215,12 +262,12 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private async Task<string> RunBotCliDumpOwnedAsync(string botCliProject, string saveDir, string playerName)
     {
-        // On exécute: dotnet run --project PalCalc.BotCLI -- dump-owned --saveDir "<...>" --player "<...>" --json
-        // Puis on écrit stdout dans un fichier temporaire.
         var tmpDir = Path.Combine(Path.GetTempPath(), "palcalc-discordbot");
         Directory.CreateDirectory(tmpDir);
 
-        var outPath = Path.Combine(tmpDir, $"owned.{SanitizeFile(playerName)}.{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
+        var safe = SanitizeFile(playerName);
+        var outPath = Path.Combine(tmpDir, $"owned.{safe}.json");
+        var tmpPath = Path.Combine(tmpDir, $"owned.{safe}.tmp");
 
         var psi = new ProcessStartInfo
         {
@@ -248,7 +295,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         p.BeginOutputReadLine();
         p.BeginErrorReadLine();
 
-        // Timeout raisonnable (tweak si besoin)
         var timeoutMs = 60_000;
         var exited = await Task.Run(() => p.WaitForExit(timeoutMs));
         if (!exited)
@@ -268,11 +314,22 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         if (string.IsNullOrWhiteSpace(json))
             throw new Exception("BotCLI returned empty JSON.");
 
-        File.WriteAllText(outPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-        _log.LogInformation("Dump-owned OK: {Path} bytes={Bytes}", outPath, new FileInfo(outPath).Length);
+        var fileLock = GetOwnedLock(safe);
 
+        lock (fileLock)
+        {
+            File.WriteAllText(tmpPath, json, new UTF8Encoding(false));
+            try { if (File.Exists(outPath)) File.Delete(outPath); } catch { }
+            File.Move(tmpPath, outPath);
+        }
+
+        _log.LogInformation("Dump-owned OK: {Path} bytes={Bytes}", outPath, new FileInfo(outPath).Length);
         return outPath;
     }
+
+    private static readonly ConcurrentDictionary<string, object> _ownedLocks = new(StringComparer.OrdinalIgnoreCase);
+    private static object GetOwnedLock(string playerNameSafe)
+        => _ownedLocks.GetOrAdd(playerNameSafe, _ => new object());
 
     private string? ResolvePlayerNameFromUid(string uid)
     {
@@ -396,13 +453,9 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private string RenderPlan(object plan, string title)
     {
-        // 1) Capture output brut
         var raw = CaptureBreedingRenderer(plan);
-
-        // 2) Pretty format
         var pretty = PrettyFormatBreedingPlan(raw);
 
-        // 3) Header + body
         var sb = new StringBuilder();
         sb.AppendLine($"<:egg:1464196335430402122> {title}");
         sb.AppendLine();
@@ -430,144 +483,410 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         }
     }
 
+    // =========================
+    // Pretty formatter (TREE-BASED, COMPOSITE-safe)
+    // =========================
+
+    private sealed class LineNode
+    {
+        public int Id { get; init; }
+        public int Indent { get; init; }
+        public string Raw { get; init; } = "";
+        public string Text { get; init; } = "";
+        public List<LineNode> Children { get; } = new();
+
+        public override string ToString() => $"{Indent}:{Text}";
+    }
+
+    private static List<LineNode> BuildIndentTree(List<string> rawLines)
+    {
+        var roots = new List<LineNode>();
+        var stack = new Stack<LineNode>();
+        int id = 0;
+
+        foreach (var raw in rawLines)
+        {
+            var indent = CountIndent(raw);
+            var txt = raw.TrimEnd();
+            var node = new LineNode
+            {
+                Id = ++id,
+                Indent = indent,
+                Raw = raw,
+                Text = txt.Trim()
+            };
+
+            while (stack.Count > 0 && indent <= stack.Peek().Indent)
+                stack.Pop();
+
+            if (stack.Count == 0)
+                roots.Add(node);
+            else
+                stack.Peek().Children.Add(node);
+
+            stack.Push(node);
+        }
+
+        return roots;
+    }
+
+    private static IEnumerable<LineNode> Walk(LineNode n)
+    {
+        yield return n;
+        foreach (var c in n.Children)
+            foreach (var x in Walk(c))
+                yield return x;
+    }
+
+    private static IEnumerable<LineNode> Walk(IEnumerable<LineNode> roots)
+    {
+        foreach (var r in roots)
+            foreach (var n in Walk(r))
+                yield return n;
+    }
+
+    private static LineNode? FindChild(LineNode n, Func<LineNode, bool> pred)
+        => n.Children.FirstOrDefault(pred);
+
+    private static IEnumerable<LineNode> FindChildren(LineNode n, Func<LineNode, bool> pred)
+        => n.Children.Where(pred);
+
     private string PrettyFormatBreedingPlan(string raw)
     {
-        // Normalize lines
-        var lines = raw.Replace("\r\n", "\n")
-                      .Split('\n')
-                      .Select(l => l.TrimEnd())
-                      .Where(l => !string.IsNullOrWhiteSpace(l))
-                      .ToList();
+        // normalize lines (keep indentation!)
+        var rawLines = raw.Replace("\r\n", "\n")
+            .Split('\n')
+            .Where(l => !string.IsNullOrWhiteSpace(l))
+            .Select(l => l.TrimEnd())
+            .ToList();
 
         _passives.TryRefreshIfStale();
 
-        // 1) dictionnaire clé interne -> FR depuis ton JSON (la vraie source)
         var frByInternal = LoadPassiveLocFr();
-
-        // 2) dictionnaire nom anglais lisible -> clé interne, via PalDB
-        // (cache simple par appel; si tu veux optimiser, on le met en champ plus tard)
         var db = PalDB.LoadEmbedded();
         var internalByEnglish = BuildInternalByEnglishName(db);
 
-        // On va reconstruire un arbre “à l’ancienne” en suivant l’indentation (les lignes ont souvent des espaces)
-        // Mais ici on prend une approche simple: on utilise les préfixes connus.
+        var roots = BuildIndentTree(rawLines);
 
-        var sb = new StringBuilder();
+        var pals = new Dictionary<string, PalCard>(StringComparer.OrdinalIgnoreCase);
+        var steps = new List<BreedStep>();
 
-        const int INDENT_RESULT = 0;   // Pal final
-        const int INDENT_OWNED  = 2;   // Pal possédé
-        const int INDENT_PASSIVE = 4;  // Passifs d’un Pal
-
-        int indent = 0;
-        void Line(string s, int extraIndent = 0)
+        // 1) collect all nodes "- OWNED ..." / "- BRED ..." as cards
+        foreach (var node in Walk(roots))
         {
-            sb.Append(' ', Math.Max(0, (indent + extraIndent) * 2));
-            sb.AppendLine(s);
-        }
+            var t = node.Text;
 
-        string? currentStepHeader = null;
-
-        foreach (var l in lines)
-        {
-            var t = l.Trim();
-
-            // Lignes qu'on ignore (trop "bruit")
-            if (t.Equals("parents:", StringComparison.OrdinalIgnoreCase))
+            if (t.StartsWith("(COMPOSITE)", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            // Step lines
-            // Exemple: "- BRED Jormuntide Ignis WILDCARD steps=3 eggs=3 totalEggs=14"
-            if (t.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
+            if (t.Contains("OPPOSITE_WILDCARD", StringComparison.OrdinalIgnoreCase) &&
+                t.Contains("candidates=", StringComparison.OrdinalIgnoreCase))
             {
-                var info = ParseBredLine(t);
-                var palEmoji = EmojiForPal(info.palName);
-                // Un BRED peut être la cible finale OU une sous-étape.
-                // On met un header d’étape si totalEggs/eggs présents.
-                var eggsTxt = info.eggs.HasValue ? $"~{info.eggs.Value}<:egg:1464196335430402122>" : null;
-                var totalTxt = info.totalEggs.HasValue ? $" (total ~{info.totalEggs.Value}<:egg:1464196335430402122>)" : null;
-                var stepsTxt = info.steps.HasValue ? $" • {info.steps.Value} étape(s)" : "";
-
-                // Si c’est le premier BRED, on le traite comme résultat final
-                if (currentStepHeader == null)
-                {
-                    var eggPart = eggsTxt != null ? $" • {eggsTxt}" : "";
-                    var totalPart = totalTxt ?? "";
-                    Line($"{palEmoji} **{info.palName}** {FormatGender(info.gender)}{stepsTxt}{eggPart}{totalPart}", INDENT_RESULT);
-                    currentStepHeader = info.palName;
-                }
-                else
-                {
-                    Line($"🥚 **Sous-breed : {info.palName}** {FormatGender(info.gender)}{stepsTxt} • {eggsTxt}{totalTxt}");
-                    indent = 2;
-                }
-
+                // debug spam line, ignore
                 continue;
             }
 
-            // Owned lines
-            // Exemple: "- OWNED Anubis FEMALE [DimensionalPalStorage Onglet 20 en (3,5)]"
             if (t.StartsWith("- OWNED ", StringComparison.OrdinalIgnoreCase))
             {
+                // ignore wrapper "(COMPOSITE)" own line as a pal card (it is not a real pal instance)
+                if (t.StartsWith("- OWNED (COMPOSITE)", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 var owned = ParseOwnedLine(t);
-                var palEmoji = EmojiForPal(owned.palName);
+                var key = PalKey(owned.palName, owned.gender, node.Id);
 
                 var loc = LocalizeLocation(owned.location);
+                var header = $"{EmojiForPal(owned.palName)} **{owned.palName}** {FormatGender(owned.gender)}" +
+                             $"{(string.IsNullOrWhiteSpace(loc) ? "" : $" — `{loc}`")}";
 
-                Line($"{palEmoji} **{owned.palName}** {FormatGender(owned.gender)}{(string.IsNullOrWhiteSpace(loc) ? "" : $" — `{loc}`")}",
-                    INDENT_OWNED);
+                UpsertPalCard(pals, key, header);
 
-                continue;
+                var actual = ExtractActualFromNode(node, frByInternal, internalByEnglish);
+                if (actual is { Count: > 0 })
+                    pals[key].ActualPassives = actual;
+
+                // store node->key mapping for later resolution
+                _nodeKey[node.Id] = key;
             }
-
-            // passives
-            // Exemple: "passives: Demon God, Diamond Body, (Random)"
-            if (t.StartsWith("passives:", StringComparison.OrdinalIgnoreCase))
+            else if (t.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
             {
-                var pass = t.Substring("passives:".Length).Trim();
+                var info = ParseBredLine(t);
+                var key = PalKey(info.palName, info.gender, node.Id);
 
-                // Découpe "A, B, (Random)" -> tokens
-                var tokens = pass.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                .Select(x => x.Trim())
-                                .Select(x => LocalizePassiveToken(x, frByInternal, internalByEnglish))
-                                .ToList();
+                var header = $"{EmojiForPal(info.palName)} **{info.palName}** {FormatGender(info.gender)}{FormatBredMeta(info.steps, info.eggs, info.totalEggs)}";
+                UpsertPalCard(pals, key, header);
 
-                Line($"🧬 Passifs attendus : **{string.Join(", ", tokens)}**", extraIndent: 0);
-                continue;
+                var actual = ExtractActualFromNode(node, frByInternal, internalByEnglish);
+                if (actual is { Count: > 0 })
+                    pals[key].ActualPassives = actual;
+
+                _nodeKey[node.Id] = key;
             }
+        }
 
-            // eff / actual
-            // eff / héritage → volontairement ignoré pour lisibilité
-            if (t.StartsWith("eff", StringComparison.OrdinalIgnoreCase))
+        // 2) build steps by reading each "- BRED ..." node's "parents:"
+        foreach (var bredNode in Walk(roots).Where(n => n.Text.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase)))
+        {
+            // output key
+            if (!_nodeKey.TryGetValue(bredNode.Id, out var outKey))
                 continue;
 
-            if (t.StartsWith("actual", StringComparison.OrdinalIgnoreCase))
+            var parentsNode = FindChild(bredNode, c => c.Text.Equals("parents:", StringComparison.OrdinalIgnoreCase));
+            if (parentsNode == null)
+                continue;
+
+            var parentKeys = new List<string>(2);
+
+            foreach (var entry in parentsNode.Children)
             {
-                // "actual : Demon God"
-                var val = t.Split(':', 2).LastOrDefault()?.Trim() ?? t;
+                var resolved = ResolveParentKey(entry);
+                if (resolved == null)
+                    continue;
 
-                var tokens = val.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                .Select(x => x.Trim())
-                                .Select(x => LocalizePassiveToken(x, frByInternal, internalByEnglish))
-                                .ToList();
-
-                Line(
-                    $"{EmojiReal()} Passifs : **{string.Join(", ", tokens)}**",
-                    INDENT_PASSIVE
-                );
-
-                continue;
+                parentKeys.Add(resolved);
+                if (parentKeys.Count == 2)
+                    break;
             }
 
-            // fallback: si on tombe sur un truc inconnu, on l’affiche proprement sans casser
-            // mais on évite de spammer si ça ressemble à un séparateur
-            if (t.All(c => c == '=' || c == '-' || c == '_'))
-                continue;
+            if (parentKeys.Count == 2)
+                steps.Add(new BreedStep(parentKeys[0], parentKeys[1], outKey));
+        }
 
-            Line($"• {t}");
+        // 3) order steps ingredients -> target
+        var ordered = TopoOrderSteps(steps);
+
+        if (ordered.Count == 0)
+            return "😶 Aucun step détecté (format renderer inattendu ?)";
+
+        // 4) render
+        var sb = new StringBuilder();
+        sb.AppendLine("**Étapes (ingrédients → cible)**");
+        sb.AppendLine();
+
+        var producedAt = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            var st = ordered[i];
+            var stepNo = i + 1;
+
+            sb.AppendLine($"**Étape {stepNo}**");
+
+            AppendPalBlock(sb, pals, st.ParentAKey, producedAt, indentLevel: 1);
+            AppendPalBlock(sb, pals, st.ParentBKey, producedAt, indentLevel: 1);
+
+            var outCard = pals.TryGetValue(st.OutputKey, out var oc) ? oc : null;
+            var outLabel = outCard?.ShortLabel ?? st.OutputKey;
+
+            sb.AppendLine($"{Indent(1)}**= {pals[st.ParentAKey].ShortLabel} + {pals[st.ParentBKey].ShortLabel} → {outLabel}**");
+
+            producedAt[st.OutputKey] = stepNo;
+
+            if (outCard != null)
+            {
+                sb.AppendLine($"{Indent(1)}{outCard.HeaderLineRawWithoutEmoji ?? outCard.HeaderLine}");
+                if (outCard.ActualPassives is { Count: > 0 })
+                    sb.AppendLine($"{Indent(2)}{EmojiReal()} Passifs : **{string.Join(", ", outCard.ActualPassives)}**");
+            }
+
+            sb.AppendLine();
         }
 
         return sb.ToString().TrimEnd();
+
+        // -------- local helpers (tree based) --------
+
+        string? ResolveParentKey(LineNode entry)
+        {
+            // parent entry can be:
+            // - OWNED ...
+            // - BRED ...
+            // - OWNED (COMPOSITE) ...  -> pick first real child OWNED/BRED
+            var t = entry.Text;
+
+            if (t.StartsWith("- OWNED (COMPOSITE)", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("(COMPOSITE)", StringComparison.OrdinalIgnoreCase))
+            {
+                // descend: find first descendant that is a real OWNED/BRED (NOT composite)
+                foreach (var d in Walk(entry))
+                {
+                    if (d.Id == entry.Id) continue;
+
+                    var dt = d.Text;
+                    if (dt.StartsWith("- OWNED (COMPOSITE)", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (dt.StartsWith("- OWNED ", StringComparison.OrdinalIgnoreCase) ||
+                        dt.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (_nodeKey.TryGetValue(d.Id, out var k))
+                            return k;
+                    }
+                }
+
+                return null;
+            }
+
+            if (t.StartsWith("- OWNED ", StringComparison.OrdinalIgnoreCase) ||
+                t.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
+            {
+                return _nodeKey.TryGetValue(entry.Id, out var k) ? k : null;
+            }
+
+            return null;
+        }
+
+        List<string>? ExtractActualFromNode(LineNode n,
+            Dictionary<string, string> frByInternal2,
+            Dictionary<string, string> internalByEnglish2)
+        {
+            // actual line is usually a child like: "actual : Diamond Body"
+            foreach (var c in n.Children)
+            {
+                var tx = c.Text;
+                if (!tx.StartsWith("actual", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var idx = tx.IndexOf(':');
+                var val = (idx >= 0 ? tx[(idx + 1)..] : "").Trim();
+                if (string.IsNullOrWhiteSpace(val))
+                    return null;
+
+                var tokens = val.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(x => x.Trim())
+                    .Select(x => LocalizePassiveToken(x, frByInternal2, internalByEnglish2))
+                    .ToList();
+
+                return tokens;
+            }
+
+            return null;
+        }
     }
+
+    // nodeId -> internal key (unique)
+    private readonly Dictionary<int, string> _nodeKey = new();
+
+    private sealed class PalCard
+    {
+        public string HeaderLine { get; set; } = "";
+        public string ShortLabel { get; set; } = "";
+        public List<string>? ActualPassives { get; set; }
+        public string? HeaderLineRawWithoutEmoji { get; set; }
+    }
+
+    private sealed record BreedStep(string ParentAKey, string ParentBKey, string OutputKey);
+
+    private static string PalKey(string palName, string? gender, int nodeId)
+        => $"{palName}|{(string.IsNullOrWhiteSpace(gender) ? "?" : gender.ToUpperInvariant())}|{nodeId}";
+
+    private void UpsertPalCard(Dictionary<string, PalCard> pals, string key, string header)
+    {
+        var parts = key.Split('|');
+        var name = parts[0];
+        var gender = parts.Length > 1 ? parts[1] : "?";
+        var shortLabel = $"{name}{FormatGender(gender)}";
+
+        if (!pals.TryGetValue(key, out var card))
+        {
+            card = new PalCard();
+            pals[key] = card;
+        }
+
+        card.HeaderLine = header;
+        card.ShortLabel = shortLabel;
+        card.HeaderLineRawWithoutEmoji = header;
+    }
+
+    private static string FormatBredMeta(int? steps, int? eggs, int? totalEggs)
+    {
+        var bits = new List<string>();
+
+        if (steps.HasValue) bits.Add($"{steps.Value} attempt(s)");
+        if (eggs.HasValue) bits.Add($"~{eggs.Value}<:egg:1464196335430402122>");
+        if (totalEggs.HasValue) bits.Add($"total ~{totalEggs.Value}<:egg:1464196335430402122>");
+
+        return bits.Count == 0 ? "" : $"  ({string.Join(" • ", bits)})";
+    }
+
+    private static List<BreedStep> TopoOrderSteps(List<BreedStep> steps)
+    {
+        if (steps.Count <= 1) return steps;
+
+        // outputKey -> step index
+        var producer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < steps.Count; i++)
+            if (!producer.ContainsKey(steps[i].OutputKey))
+                producer[steps[i].OutputKey] = i;
+
+        var indeg = new int[steps.Count];
+        var adj = new List<int>[steps.Count];
+        for (int i = 0; i < steps.Count; i++)
+            adj[i] = new List<int>();
+
+        // edge: if step j uses as input an output produced by step i, then i -> j
+        for (int j = 0; j < steps.Count; j++)
+        {
+            var s = steps[j];
+            foreach (var input in new[] { s.ParentAKey, s.ParentBKey })
+            {
+                if (!producer.TryGetValue(input, out var i))
+                    continue;
+                if (i == j) continue;
+
+                adj[i].Add(j);
+                indeg[j]++;
+            }
+        }
+
+        var q = new Queue<int>();
+        for (int i = 0; i < steps.Count; i++)
+            if (indeg[i] == 0) q.Enqueue(i);
+
+        var ordered = new List<BreedStep>(steps.Count);
+
+        while (q.Count > 0)
+        {
+            var i = q.Dequeue();
+            ordered.Add(steps[i]);
+
+            foreach (var j in adj[i])
+            {
+                indeg[j]--;
+                if (indeg[j] == 0)
+                    q.Enqueue(j);
+            }
+        }
+
+        return ordered.Count == steps.Count ? ordered : steps;
+    }
+
+    private static void AppendPalBlock(
+        StringBuilder sb,
+        Dictionary<string, PalCard> pals,
+        string key,
+        Dictionary<string, int> producedAt,
+        int indentLevel)
+    {
+        if (!pals.TryGetValue(key, out var card))
+        {
+            sb.AppendLine($"{Indent(indentLevel)}• {key}");
+            return;
+        }
+
+        var producedHint = producedAt.TryGetValue(key, out var stepNo)
+            ? $" _(résultat étape {stepNo})_"
+            : "";
+
+        sb.AppendLine($"{Indent(indentLevel)}- {card.HeaderLine}{producedHint}");
+
+        if (card.ActualPassives is { Count: > 0 })
+            sb.AppendLine($"{Indent(indentLevel + 1)}{EmojiRealStatic()} Passifs : **{string.Join(", ", card.ActualPassives)}**");
+    }
+
+    private static string Indent(int level) => new string(' ', level * 2);
+
+    private static string EmojiRealStatic() => "<:passive_rank_arrow_03:1464196763891138684>";
 
     private static string FormatGender(string? g)
     {
@@ -584,15 +903,12 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private static (string palName, string? gender, int? steps, int? eggs, int? totalEggs) ParseBredLine(string line)
     {
-        // "- BRED <name> <gender> steps=3 eggs=3 totalEggs=14"
         var t = line.Substring("- BRED ".Length).Trim();
 
         int? eggs = TryParseIntAfter(t, "eggs");
         int? total = TryParseIntAfter(t, "totalEggs");
         int? steps = TryParseIntAfter(t, "steps");
 
-        // gender est souvent le dernier token "MALE/FEMALE/WILDCARD/OPPOSITE_WILDCARD"
-        // on coupe avant "steps="
         var beforeStats = t;
         var idxStats = t.IndexOf(" steps=", StringComparison.OrdinalIgnoreCase);
         if (idxStats < 0) idxStats = t.IndexOf(" eggs=", StringComparison.OrdinalIgnoreCase);
@@ -613,13 +929,11 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         }
 
         var palName = string.Join(' ', parts);
-
         return (palName, gender, steps, eggs, total);
     }
 
     private static (string palName, string? gender, string? location) ParseOwnedLine(string line)
     {
-        // "- OWNED <name> FEMALE [Location ...]"
         var t = line.Substring("- OWNED ".Length).Trim();
 
         string? location = null;
@@ -650,14 +964,12 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private static int? TryParseIntAfter(string text, string key)
     {
-        // accepte "key=123" OU "key~123"
         var i = text.IndexOf(key, StringComparison.OrdinalIgnoreCase);
         if (i < 0) return null;
         i += key.Length;
 
         if (i >= text.Length) return null;
 
-        // saute '=' ou '~' ou ':' si jamais
         if (text[i] is '=' or '~' or ':') i++;
 
         int j = i;
@@ -669,31 +981,11 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         return int.TryParse(slice, out var v) ? v : null;
     }
 
-    private static IEnumerable<string> ChunkForDiscord(string text, int max)
-    {
-        if (string.IsNullOrEmpty(text)) yield break;
-
-        var lines = text.Replace("\r\n", "\n").Split('\n');
-        var sb = new StringBuilder();
-
-        foreach (var line in lines)
-        {
-            if (sb.Length + line.Length + 1 > max)
-            {
-                yield return sb.ToString();
-                sb.Clear();
-            }
-            sb.AppendLine(line);
-        }
-
-        if (sb.Length > 0)
-            yield return sb.ToString();
-    }
-
     private static int Clamp(int v) => v < 0 ? 0 : (v > 100 ? 100 : v);
 
     private static string Quote(string s) => $"\"{s.Replace("\"", "\\\"")}\"";
     private static string TrimForLog(string s, int max) => s.Length <= max ? s : s.Substring(0, max) + "…";
+
     private static string SanitizeFile(string s)
     {
         var bad = Path.GetInvalidFileNameChars();
@@ -709,8 +1001,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         return _emojis.TryGet(key) ?? "";
     }
 
-    private string EmojiReal() => _emojis.TryGet("passive_rank_arrow_03") ?? "";
-    private string EmojiInherit() => _emojis.TryGet("passive_rank_arrow_04") ?? "";
+    private string EmojiReal() => "<:passive_rank_arrow_03:1464196763891138684>";
+    private string EmojiInherit() => "<:passive_rank_arrow_04:1464197339559231572>";
 
     private string LocalizePassiveToken(
         string token,
@@ -722,17 +1014,16 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         if (token.Equals("(Random)", StringComparison.OrdinalIgnoreCase))
             return "🎲 aléatoire";
 
-        // 1) si c'est déjà une clé interne (ex: Nocturnal, PAL_ALLAttack_up3)
         if (frByInternal.TryGetValue(token, out var fr1))
             return fr1;
 
-        // 2) si c'est un nom anglais lisible (ex: "Diamond Body")
         if (internalByEnglish.TryGetValue(token, out var internalKey) &&
             frByInternal.TryGetValue(internalKey, out var fr2))
             return fr2;
 
         return token;
     }
+
     private Dictionary<string, string> LoadPassiveLocFr()
     {
         var path = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
@@ -765,7 +1056,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private Dictionary<string, string> BuildInternalByEnglishName(PalDB db)
     {
-        // map "Diamond Body" (anglais) -> "Deffence_up3" (internal key)
         var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var ps in db.PassiveSkills)
@@ -773,12 +1063,10 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (string.IsNullOrWhiteSpace(ps.InternalName))
                 continue;
 
-            // Selon les versions de PalDB, le champ "Name" peut être l'anglais lisible
             var en = (ps.Name ?? "").Trim();
             if (string.IsNullOrWhiteSpace(en))
                 continue;
 
-            // si doublon, on garde le premier (ça suffit)
             if (!dict.ContainsKey(en))
                 dict[en] = ps.InternalName!;
         }
@@ -793,28 +1081,179 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
         var s = location.Trim();
 
-        // Le renderer peut te sortir "DimensionalPalStorage ..."
-        s = s.Replace("DimensionalPalStorage", "Stockage de Pals dimensionnel", StringComparison.OrdinalIgnoreCase);
-
-        // Le JSON peut avoir "Dimensional Pal Storage (Selene), ..."
-        s = s.Replace("Dimensional Pal Storage", "Stockage de Pals dimensionnel", StringComparison.OrdinalIgnoreCase);
-
+        s = s.Replace("DimensionalPalStorage", "Stockage dimensionnel", StringComparison.OrdinalIgnoreCase);
+        s = s.Replace("Dimensional Pal Storage", "Stockage dimensionnel", StringComparison.OrdinalIgnoreCase);
         s = s.Replace("GlobalPalBox", "Boîte à Pals globale", StringComparison.OrdinalIgnoreCase);
-
         s = s.Replace("Party", "Équipe", StringComparison.OrdinalIgnoreCase);
 
-        // Si jamais t’as encore des vieux tokens qui pop (optionnel)
         s = s.Replace("Palbox", "Boîte à Pals", StringComparison.OrdinalIgnoreCase);
         s = s.Replace("MarketStall", "Marché aux puces", StringComparison.OrdinalIgnoreCase);
 
-        s = Regex.Replace(
-            s,
-            @"\s+Onglet\s+",
-            ", Onglet ",
-            RegexOptions.IgnoreCase
-        );
-
+        s = Regex.Replace(s, @"\s+Onglet\s+", ", Onglet ", RegexOptions.IgnoreCase);
         return s;
     }
 
+    // =========================
+    // Pager
+    // =========================
+
+    private sealed class PagerSession
+    {
+        public ulong OwnerUserId { get; init; }
+        public DateTime CreatedUtc { get; init; } = DateTime.UtcNow;
+        public ulong ChannelId { get; init; }
+        public ulong MessageId { get; init; }
+        public Embed Header { get; init; } = default!;
+        public List<string> Pages { get; init; } = new();
+        public int Index { get; set; }
+    }
+
+    private static readonly ConcurrentDictionary<string, PagerSession> _pager = new();
+    private static readonly TimeSpan PagerTtl = TimeSpan.FromMinutes(15);
+
+    private static string TruncateForEmbed(string s, int max = 3800)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        if (s.Length <= max) return s;
+        return s.Substring(0, max - 1) + "…";
+    }
+
+    private Embed BuildSolutionEmbed(PagerSession sess)
+    {
+        var idx = sess.Index;
+        var title = $"Solution {idx + 1}/{sess.Pages.Count}";
+        return new EmbedBuilder()
+            .WithTitle(title)
+            .WithDescription(TruncateForEmbed(PreserveIndentForEmbed(sess.Pages[idx])))
+            .WithColor(new Color(88, 101, 242))
+            .Build();
+    }
+
+    private static MessageComponent BuildPagerComponents(string key)
+    {
+        var cb = new ComponentBuilder()
+            .WithButton("◀", $"palcalc:prev:{key}", ButtonStyle.Secondary)
+            .WithButton("▶", $"palcalc:next:{key}", ButtonStyle.Secondary)
+            .WithButton("Fermer", $"palcalc:close:{key}", ButtonStyle.Danger);
+
+        return cb.Build();
+    }
+
+    private bool IsExpired(PagerSession s)
+        => (DateTime.UtcNow - s.CreatedUtc) > PagerTtl;
+
+    [ComponentInteraction("palcalc:prev:*")]
+    public async Task PagerPrevAsync(string pagerKey)
+    {
+        await DeferAsync();
+
+        if (!_pager.TryGetValue(pagerKey, out var sess))
+            return;
+
+        if (IsExpired(sess))
+        {
+            _pager.TryRemove(pagerKey, out _);
+            await ModifyPagerMessageAsync(sess, pagerKey, content: "⏳ Session expirée.", close: true);
+            return;
+        }
+
+        if (Context.User.Id != sess.OwnerUserId)
+        {
+            await FollowupAsync("Pas ta navigation 🙂", ephemeral: true);
+            return;
+        }
+
+        sess.Index = (sess.Index - 1 + sess.Pages.Count) % sess.Pages.Count;
+        await ModifyPagerMessageAsync(sess, pagerKey);
+    }
+
+    [ComponentInteraction("palcalc:next:*")]
+    public async Task PagerNextAsync(string pagerKey)
+    {
+        await DeferAsync();
+
+        if (!_pager.TryGetValue(pagerKey, out var sess))
+            return;
+
+        if (IsExpired(sess))
+        {
+            _pager.TryRemove(pagerKey, out _);
+            await ModifyPagerMessageAsync(sess, pagerKey, content: "⏳ Session expirée.", close: true);
+            return;
+        }
+
+        if (Context.User.Id != sess.OwnerUserId)
+        {
+            await FollowupAsync("Pas ta navigation 🙂", ephemeral: true);
+            return;
+        }
+
+        sess.Index = (sess.Index + 1) % sess.Pages.Count;
+        await ModifyPagerMessageAsync(sess, pagerKey);
+    }
+
+    [ComponentInteraction("palcalc:close:*")]
+    public async Task PagerCloseAsync(string pagerKey)
+    {
+        await DeferAsync();
+
+        if (!_pager.TryGetValue(pagerKey, out var sess))
+            return;
+
+        if (Context.User.Id != sess.OwnerUserId)
+        {
+            await FollowupAsync("Pas ta session 🙂", ephemeral: true);
+            return;
+        }
+
+        _pager.TryRemove(pagerKey, out _);
+        await ModifyPagerMessageAsync(sess, pagerKey, content: "✅ Fermé.", close: true);
+    }
+
+    private async Task<IUserMessage?> GetPagerMessageAsync(PagerSession sess)
+    {
+        if (Context.Client.GetChannel(sess.ChannelId) is not IMessageChannel ch)
+            return null;
+
+        var m = await ch.GetMessageAsync(sess.MessageId);
+        return m as IUserMessage;
+    }
+
+    private async Task<bool> ModifyPagerMessageAsync(PagerSession sess, string pagerKey, string? content = null, bool close = false)
+    {
+        var msg = await GetPagerMessageAsync(sess);
+        if (msg == null) return false;
+
+        await msg.ModifyAsync(m =>
+        {
+            m.Content = content;
+            m.Embeds = close
+                ? new[] { sess.Header }
+                : new[] { sess.Header, BuildSolutionEmbed(sess) };
+
+            m.Components = close
+                ? new ComponentBuilder().Build()
+                : BuildPagerComponents(pagerKey);
+        });
+
+        return true;
+    }
+
+    private static string PreserveIndentForEmbed(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+
+        return Regex.Replace(
+            s,
+            @"(?m)^( +)",
+            m => new string('\u00A0', m.Value.Length)
+        );
+    }
+
+    private static int CountIndent(string line)
+    {
+        int n = 0;
+        while (n < line.Length && line[n] == ' ') n++;
+        return n;
+    }
 }
