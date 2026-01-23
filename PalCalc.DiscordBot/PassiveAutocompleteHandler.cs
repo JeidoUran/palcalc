@@ -16,21 +16,22 @@ public sealed class PassiveAutocompleteHandler : AutocompleteHandler
         IParameterInfo parameter,
         IServiceProvider services)
     {
-        // refresh non-bloquant
+        // Refresh en arrière-plan si besoin (non bloquant)
         _passives.TryRefreshIfStale();
 
         var value = (interaction.Data.Current?.Value as string ?? "").Trim();
 
-        // IMPORTANT: on filtre uniquement en mémoire
         var cached = _passives.GetCachedFast();
 
         var results = cached
             .Where(p =>
-                string.IsNullOrWhiteSpace(value)
-                || p.Name.Contains(value, StringComparison.OrdinalIgnoreCase)
-                || p.Id.Contains(value, StringComparison.OrdinalIgnoreCase))
+                string.IsNullOrWhiteSpace(value) ||
+                p.Name.Contains(value, StringComparison.OrdinalIgnoreCase))
             .Take(25)
-            .Select(p => new AutocompleteResult(p.Name, p.Id));
+            .Select(p =>
+                // label = nom FR, value = internalName
+                new AutocompleteResult(p.Name, p.Id)
+            );
 
         return Task.FromResult(AutocompletionResult.FromSuccess(results));
     }

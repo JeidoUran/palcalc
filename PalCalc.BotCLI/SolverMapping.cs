@@ -6,7 +6,7 @@ using System.Text.Json;
 
 using PalCalc.Model;
 
-internal static class SolverMapping
+public static class SolverMapping
 {
     private sealed class OwnedJsonEntry
     {
