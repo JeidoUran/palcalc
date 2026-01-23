@@ -13,6 +13,15 @@ static class LocalizationExport
         // Charge la DB embarquée de PalCalc (db.json)
         var db = PalDB.LoadEmbedded();
 
+        var ps = db.PassiveSkills.FirstOrDefault();
+        if (ps != null)
+        {
+            Console.Error.WriteLine(
+                "[DEBUG PassiveSkill props] " +
+                string.Join(", ", ps.GetType().GetProperties().Select(p => p.Name))
+            );
+        }
+
         lang = string.IsNullOrWhiteSpace(lang) ? "fr" : lang.Trim();
 
         static string PickLocalized(Dictionary<string, string>? dict, string lang, string fallback)
@@ -40,6 +49,7 @@ static class LocalizationExport
         // Passifs: InternalName -> Nom localisé
         var passives = db.PassiveSkills
             .Where(ps => !string.IsNullOrWhiteSpace(ps.InternalName))
+            .Where(ps => GetIsPalPassive(ps)) // <- même helper reflection
             .ToDictionary(
                 ps => ps.InternalName!,
                 ps => PickLocalized(ps.LocalizedNames, lang, ps.Name ?? ps.InternalName!)
@@ -63,5 +73,21 @@ static class LocalizationExport
             Directory.CreateDirectory(dir);
 
         File.WriteAllText(outPath, JsonSerializer.Serialize(payload, jsonOpts));
+    }
+
+    private static bool GetIsPalPassive(PassiveSkill ps)
+    {
+        var t = ps.GetType();
+
+        // Noms possibles (tu peux en ajouter si besoin)
+        foreach (var propName in new[] { "IsStandardPassiveSkill" })
+        {
+            var p = t.GetProperty(propName);
+            if (p != null && p.PropertyType == typeof(bool))
+                return (bool)(p.GetValue(ps) ?? false);
+        }
+
+        // fallback: pas trouvé -> on ne peut pas filtrer proprement
+        return true;
     }
 }

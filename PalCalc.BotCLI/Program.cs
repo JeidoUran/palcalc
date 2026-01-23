@@ -21,6 +21,7 @@ using PalCalc.Solver;
 using PalCalc.Solver.ResultPruning;
 using PalCalc.Solver.PalReference;
 
+using PalCalc.BotCLI;
 static class Program
 {
     static readonly JsonSerializerOptions JsonOpts = new()
@@ -88,7 +89,7 @@ static class Program
 
             if (cmd.Equals("list-players", StringComparison.OrdinalIgnoreCase))
             {
-                var players = LoadPlayersFromLevel(saveDir);
+                var players = PlayerListReader.LoadPlayersFromLevel(saveDir);
 
                 var payload = players
                     .OrderBy(p => p.name, StringComparer.OrdinalIgnoreCase)
@@ -110,7 +111,7 @@ static class Program
                     return 1;
                 }
 
-                var players = LoadPlayersFromLevel(saveDir);
+                var players = PlayerListReader.LoadPlayersFromLevel(saveDir);
                 var match = players.FirstOrDefault(p => p.name.Equals(playerName, StringComparison.OrdinalIgnoreCase));
 
                 if (string.IsNullOrWhiteSpace(match.id))
@@ -195,91 +196,6 @@ Examples:
   dotnet run --project PalCalc.BotCLI -- dump-owned --saveDir "C:\...\SaveGames\0\<WORLDID>" --player "Selene" --json --debug
 """);
     }
-
-    // =====================================================================
-    // list-players (basé sur Level.sav)
-    // =====================================================================
-
-    static List<(string id, string name)> LoadPlayersFromLevel(string saveDir)
-    {
-        var results = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        var levelPath = Path.Combine(saveDir, "Level.sav");
-        if (!File.Exists(levelPath))
-            throw new FileNotFoundException("Level.sav not found", levelPath);
-
-        var tmpDir = Path.Combine(saveDir, "_palcalc_tmp");
-        Directory.CreateDirectory(tmpDir);
-
-        var tmpLevel = Path.Combine(tmpDir, $"Level.snapshot.{DateTime.UtcNow:yyyyMMdd_HHmmss_fff}.sav");
-
-        const int attempts = 5;
-        Exception? last = null;
-
-        for (int a = 0; a < attempts; a++)
-        {
-            try
-            {
-                File.Copy(levelPath, tmpLevel, overwrite: true);
-
-                long s1 = new FileInfo(tmpLevel).Length;
-                System.Threading.Thread.Sleep(150);
-                long s2 = new FileInfo(tmpLevel).Length;
-
-                if (s1 != s2 || s2 < 64)
-                    throw new IOException($"Snapshot unstable (size {s1} -> {s2}). Server is probably writing.");
-
-                CompressedSAV.WithDecompressedSave(tmpLevel, stream =>
-                {
-                    using var fa = new FArchiveReader(stream, PalWorldTypeHints.Hints, archivePreserve: true);
-                    var gvas = GvasFile.FromFArchive(fa, []);
-
-                    if (gvas.Properties == null || !gvas.Properties.TryGetValue("worldSaveData", out var worldProp))
-                        return;
-
-                    var worldDict = AsDict(GetValue(worldProp));
-                    if (worldDict == null || !worldDict.TryGetValue("CharacterSaveParameterMap", out var mapProp))
-                        return;
-
-                    var mapVal = GetValue(mapProp);
-                    if (mapVal is not IDictionary dict)
-                        return;
-
-                    foreach (DictionaryEntry de in dict)
-                    {
-                        var keyDict = AsDict(de.Key);
-                        var uid = ExtractPlayerUidFromKeyDict(keyDict);
-
-                        var valDict = AsDict(de.Value);
-                        var (nickname, isPlayer) = ExtractNicknameAndIsPlayerFromValueDict(valDict);
-
-                        if (!isPlayer) continue;
-                        if (string.IsNullOrWhiteSpace(uid)) continue;
-                        if (string.IsNullOrWhiteSpace(nickname)) continue;
-
-                        if (!results.ContainsKey(uid))
-                            results[uid] = nickname;
-                    }
-                });
-
-                break; // success
-            }
-            catch (Exception ex)
-            {
-                last = ex;
-                try { if (File.Exists(tmpLevel)) File.Delete(tmpLevel); } catch { }
-                System.Threading.Thread.Sleep(200);
-            }
-        }
-
-        try { if (File.Exists(tmpLevel)) File.Delete(tmpLevel); } catch { }
-
-        if (results.Count == 0 && last != null)
-            throw new Exception("Failed to read players from Level.sav snapshot after retries.", last);
-
-        return results.Select(kv => (kv.Key, kv.Value)).ToList();
-    }
-
     static string? ExtractPlayerUidFromKeyDict(Dictionary<string, object>? keyDict)
     {
         if (keyDict == null) return null;
@@ -362,7 +278,7 @@ Examples:
     static List<object> DumpOwned(string worldDir, string playerName, bool debug)
     {
         var localization = LocalizationLoader.Load("localization.fr.json");
-        var players = LoadPlayersFromLevel(worldDir);
+        var players = PlayerListReader.LoadPlayersFromLevel(worldDir);
         var target = players.FirstOrDefault(p => p.name.Equals(playerName, StringComparison.OrdinalIgnoreCase));
         if (string.IsNullOrWhiteSpace(target.id))
             throw new Exception($"Player not found: {playerName}");
