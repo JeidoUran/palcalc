@@ -14,12 +14,12 @@ public static class BreedingPlanRenderer
                 Console.WriteLine($"{indent}- OWNED {o.Pal.Name} {o.Gender} [{FormatPalLocation(o.UnderlyingInstance.Location)}]");
 
                 var eff = (o.EffectivePassives.Count == 0)
-                    ? "no passives"
+                    ? "Aucun passif"
                     : string.Join(", ", o.EffectivePassives.Select(p => p.Name));
 
                 var actualList = o.ActualPassives ?? o.UnderlyingInstance?.PassiveSkills;
                 var actual = (actualList == null || actualList.Count == 0)
-                    ? "no passives"
+                    ? "Aucun passif"
                     : string.Join(", ", actualList.Select(p => p.Name));
 
                 Console.WriteLine($"{indent}    eff    : {eff}");
