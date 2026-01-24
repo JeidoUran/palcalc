@@ -24,8 +24,20 @@ public static class PlayerListReader
         if (!File.Exists(levelPath))
             throw new FileNotFoundException("Level.sav not found", levelPath);
 
-        var tmpDir = Path.Combine(saveDir, "_palcalc_tmp");
+        // ✅ tmp en dehors du world save => ne gonfle plus les backups
+        var worldName = new DirectoryInfo(saveDir).Name;
+        var tmpDir = Path.Combine(Path.GetTempPath(), "palcalc_tmp", worldName);
         Directory.CreateDirectory(tmpDir);
+
+        try
+        {
+            var di = new DirectoryInfo(tmpDir);
+            foreach (var f in di.EnumerateFiles("Level.snapshot.*.sav").OrderByDescending(f => f.CreationTimeUtc).Skip(5))
+            {
+                try { f.Delete(); } catch { }
+            }
+        }
+        catch { }
 
         var tmpLevel = Path.Combine(tmpDir, $"Level.snapshot.{DateTime.UtcNow:yyyyMMdd_HHmmss_fff}.sav");
 

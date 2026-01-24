@@ -4,7 +4,14 @@ using System.Linq;
 
 static class StableWorldSnapshot
 {
-    public static string Create(string worldDir, bool includeAllPlayers, string? onlyPlayerHex32NoDashesUpper, bool debug)
+    // Par défaut : on garde un petit historique (utile en debug). Mets 0 pour tout supprimer.
+    const int KeepLastSnapshots = 2;
+
+    public static string Create(
+        string worldDir,
+        bool includeAllPlayers,
+        string? onlyPlayerHex32NoDashesUpper,
+        bool debug)
     {
         var srcLevel = Path.Combine(worldDir, "Level.sav");
         var srcPlayersDir = Path.Combine(worldDir, "Players");
@@ -14,8 +21,13 @@ static class StableWorldSnapshot
         if (!Directory.Exists(srcPlayersDir))
             throw new DirectoryNotFoundException($"Players dir not found: {srcPlayersDir}");
 
-        var tmpRoot = Path.Combine(worldDir, "_palcalc_tmp");
+        // ✅ IMPORTANT : tmpRoot en dehors du worldDir => ne gonfle plus tes backups.
+        var worldName = new DirectoryInfo(worldDir).Name;
+        var tmpRoot = Path.Combine(Path.GetTempPath(), "palcalc_tmp", worldName);
         Directory.CreateDirectory(tmpRoot);
+
+        // ✅ Nettoyage des anciens snapshots
+        CleanupOldSnapshots(tmpRoot, keepLast: KeepLastSnapshots, debug: debug);
 
         var snapshotDir = Path.Combine(tmpRoot, $"world.snapshot.{DateTime.UtcNow:yyyyMMdd_HHmmss_fff}");
         Directory.CreateDirectory(snapshotDir);
@@ -31,7 +43,6 @@ static class StableWorldSnapshot
 
         if (!includeAllPlayers && !string.IsNullOrWhiteSpace(onlyPlayerHex32NoDashesUpper))
         {
-            // Copie le .sav du joueur + le _dps.sav du joueur si présent
             var wanted = onlyPlayerHex32NoDashesUpper.Trim().ToUpperInvariant();
             playerFiles = playerFiles
                 .Where(p =>
@@ -40,11 +51,6 @@ static class StableWorldSnapshot
                     return name == (wanted + ".SAV") || name == (wanted + "_DPS.SAV");
                 })
                 .ToList();
-        }
-        else
-        {
-            // Tout copier (inclut aussi *_dps.sav)
-            // Rien à faire
         }
 
         foreach (var src in playerFiles)
@@ -60,6 +66,49 @@ static class StableWorldSnapshot
         }
 
         return snapshotDir;
+    }
+
+    public static void TryDeleteSnapshotDir(string snapshotDir, bool debug = false)
+    {
+        try
+        {
+            if (Directory.Exists(snapshotDir))
+                Directory.Delete(snapshotDir, recursive: true);
+
+            if (debug)
+                Console.Error.WriteLine($"[snapshot] deleted={snapshotDir}");
+        }
+        catch (Exception ex)
+        {
+            if (debug)
+                Console.Error.WriteLine($"[snapshot] delete failed: {ex.Message}");
+        }
+    }
+
+    static void CleanupOldSnapshots(string tmpRoot, int keepLast, bool debug)
+    {
+        try
+        {
+            if (!Directory.Exists(tmpRoot)) return;
+
+            var dirs = new DirectoryInfo(tmpRoot)
+                .EnumerateDirectories("world.snapshot.*", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(d => d.CreationTimeUtc)
+                .ToList();
+
+            var toDelete = (keepLast <= 0) ? dirs : dirs.Skip(keepLast).ToList();
+
+            foreach (var d in toDelete)
+            {
+                try
+                {
+                    d.Delete(recursive: true);
+                    if (debug) Console.Error.WriteLine($"[snapshot] cleanup deleted={d.FullName}");
+                }
+                catch { /* on ignore, c’est du housekeeping */ }
+            }
+        }
+        catch { /* on ignore */ }
     }
 
     static void CopyStableFile(string srcPath, string dstPath)
