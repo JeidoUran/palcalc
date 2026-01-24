@@ -21,21 +21,40 @@ public static class LocalizationLoader
     /// </summary>
     public static LocalizationData Load(string path)
     {
-        if (!File.Exists(path))
-            throw new FileNotFoundException("Localization file not found", path);
+        // 1) si le path est relatif, on le résout d’abord par rapport au dossier du binaire
+        var resolved = path;
 
-        var json = File.ReadAllText(path);
+        if (!Path.IsPathRooted(resolved))
+        {
+            // essaie à côté de l’exe
+            var baseDir = AppContext.BaseDirectory;
+            var candidate1 = Path.Combine(baseDir, path);
+            if (File.Exists(candidate1))
+                resolved = candidate1;
+            else
+            {
+                // si on a passé un truc du style "PalCalc.BotCLI/localization.fr.json",
+                // on tente juste le filename à côté de l’exe (cas publish)
+                var fileName = Path.GetFileName(path);
+                var candidate2 = Path.Combine(baseDir, fileName);
+                if (File.Exists(candidate2))
+                    resolved = candidate2;
+            }
+        }
+
+        if (!File.Exists(resolved))
+            throw new FileNotFoundException("Localization file not found", resolved);
+
+        var json = File.ReadAllText(resolved);
 
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
 
-        var data = new LocalizationData
+        return new LocalizationData
         {
             Pals = ReadMap(root, "pals"),
             Passives = ReadMap(root, "passives")
         };
-
-        return data;
     }
 
     private static Dictionary<string, string> ReadMap(JsonElement root, string propertyName)

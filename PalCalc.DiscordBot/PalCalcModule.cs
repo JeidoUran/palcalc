@@ -331,17 +331,35 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         var outPath = Path.Combine(tmpDir, $"owned.{safe}.json");
         var tmpPath = Path.Combine(tmpDir, $"owned.{safe}.tmp");
 
+        var cliPath = ResolveBotCliBinaryPath();
+
         var psi = new ProcessStartInfo
         {
-            FileName = "dotnet",
-            Arguments =
-                $"run --project {Quote(botCliProject)} -- " +
-                $"dump-owned --saveDir {Quote(saveDir)} --player {Quote(playerName)} --json",
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
-            CreateNoWindow = true
+            CreateNoWindow = true,
+            WorkingDirectory = AppContext.BaseDirectory
         };
+
+        if (cliPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+        {
+            psi.FileName = "dotnet";
+            psi.ArgumentList.Add(cliPath);
+        }
+        else
+        {
+            psi.FileName = cliPath;
+        }
+
+        // args BotCLI
+        psi.ArgumentList.Add("dump-owned");
+        psi.ArgumentList.Add("--saveDir");
+        psi.ArgumentList.Add(saveDir);
+        psi.ArgumentList.Add("--player");
+        psi.ArgumentList.Add(playerName);
+        psi.ArgumentList.Add("--json");
+
 
         using var p = new Process { StartInfo = psi };
 
@@ -387,6 +405,25 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
         _log.LogInformation("Dump-owned OK: {Path} bytes={Bytes}", outPath, new FileInfo(outPath).Length);
         return outPath;
+
+    }
+
+    private string ResolveBotCliBinaryPath()
+    {
+        var baseDir = AppContext.BaseDirectory; // publish/PalCalc.DiscordBot/
+        var candidates = new[]
+        {
+            Path.Combine(baseDir, "PalCalc.BotCLI.exe"), // Windows self-contained
+            Path.Combine(baseDir, "PalCalc.BotCLI"),     // Linux self-contained
+            Path.Combine(baseDir, "PalCalc.BotCLI.dll"), // framework-dependent
+        };
+
+        var hit = candidates.FirstOrDefault(File.Exists);
+        if (hit == null)
+            throw new FileNotFoundException(
+                "BotCLI not found next to DiscordBot. Tried: " + string.Join(", ", candidates));
+
+        return hit;
     }
 
     private static readonly ConcurrentDictionary<string, object> _ownedLocks = new(StringComparer.OrdinalIgnoreCase);
@@ -1191,7 +1228,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private Dictionary<string, string> LoadPassiveLocFr()
     {
-        var path = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
+        var file = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
+        var path = Path.Combine(AppContext.BaseDirectory, file);
 
         try
         {
@@ -1465,7 +1503,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private Dictionary<string, string> LoadPalLocFr()
     {
-        var path = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
+        var file = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
+        var path = Path.Combine(AppContext.BaseDirectory, file);
 
         try
         {

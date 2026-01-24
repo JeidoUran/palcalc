@@ -277,7 +277,7 @@ Examples:
 
     static List<object> DumpOwned(string worldDir, string playerName, bool debug)
     {
-        var localization = LocalizationLoader.Load("PalCalc.BotCLI/localization.fr.json");
+        var localization = LocalizationLoader.Load("localization.fr.json");
         var players = PlayerListReader.LoadPlayersFromLevel(worldDir);
         var target = players.FirstOrDefault(p => p.name.Equals(playerName, StringComparison.OrdinalIgnoreCase));
         if (string.IsNullOrWhiteSpace(target.id))

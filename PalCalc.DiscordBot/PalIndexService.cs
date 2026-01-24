@@ -49,8 +49,8 @@ public sealed class PalIndexService
                 var locPath = _cfg["PalCalc:LocalizationFile"];
                 if (string.IsNullOrWhiteSpace(locPath))
                     locPath = "localization.fr.json";
-
-                var loc = LocalizationLoader.Load(locPath);
+                var path = Path.Combine(AppContext.BaseDirectory, locPath);
+                var loc = LocalizationLoader.Load(path);
 
                 var db = PalDB.LoadEmbedded();
 

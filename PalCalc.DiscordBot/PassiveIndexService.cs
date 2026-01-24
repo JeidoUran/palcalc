@@ -50,7 +50,8 @@ public sealed class PassiveIndexService
                 // 2) Localization (source des labels FR)
                 // -> on lit ton fichier existant. Ajuste le path si besoin (content root, etc.)
                 var locPath = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
-                var loc = LoadLocalizationMap(locPath);
+                var path = Path.Combine(AppContext.BaseDirectory, locPath);
+                var loc = LoadLocalizationMap(path);
 
                 // 3) Build list — on garde UNIQUEMENT ce qui est dans la loca (donc Pal passives only)
                 var list = db.PassiveSkills
