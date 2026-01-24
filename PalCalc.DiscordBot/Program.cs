@@ -152,9 +152,6 @@ public sealed class InteractionHandler
                 var items = await ApplicationEmojiLoader.LoadAsync(token, appId);
                 _emojis.LoadMentions(items);
                 _log.LogInformation("Application emoji registry loaded: {Count}", _emojis.Count);
-                _log.LogInformation("egg={Egg} xenolord={Xeno}",
-                    _emojis.TryGet("egg") ?? "NULL",
-                    _emojis.TryGet("xenolord") ?? "NULL");
             }
             catch (Exception ex)
             {

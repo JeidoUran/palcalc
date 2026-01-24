@@ -94,6 +94,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         // ---- resolve player display name (utile pour BotCLI) ----
         var playerName = ResolvePlayerNameFromUid(player) ?? player; // fallback
         _log.LogInformation("palcalc request: playerUid={Uid} playerName={Name} target={Target}", player, playerName, targetPalInternal);
+        _log.LogInformation("parameters: target_gender={TargetGender} passive_1={Passive1} passive_2={Passive2} passive_3={Passive3} passive_4={Passive4} iv_hp={IVHP} iv_atk={IVATK} iv_def={IVDEF}", target_gender, passive_1, passive_2, passive_3, passive_4, iv_hp, iv_atk, iv_def);
 
         // ---- build required passives ----
         var requiredPassiveIds = new[] { passive_1, passive_2, passive_3, passive_4 }
@@ -111,13 +112,37 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             var db = PalDB.LoadEmbedded();
             var gameSettings = new GameSettings();
 
+            var palFrByInternal = LoadPalLocFr(); // internal -> fr
+            var palInternalByFr = palFrByInternal
+                .GroupBy(kv => kv.Value, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Key, StringComparer.OrdinalIgnoreCase);
+
             var ownedInstances = SolverMapping.LoadOwnedPalsFromOwnedJson(ownedJsonPath, db);
 
-            // 3) Build Pal spec
-            var target = db.Pals.FirstOrDefault(p => p.InternalName.Equals(targetPalInternal, StringComparison.OrdinalIgnoreCase));
+            var targetToken = (targetPalInternal ?? "").Trim();
+
+            // 1) internal direct
+            var target = db.Pals.FirstOrDefault(p =>
+                p.InternalName.Equals(targetToken, StringComparison.OrdinalIgnoreCase));
+
+            // 2) EN name (db.Name)
             if (target == null)
             {
-                await FollowupAsync($"❌ Pal inconnu dans la DB: `{targetPalInternal}`");
+                target = db.Pals.FirstOrDefault(p =>
+                    !string.IsNullOrWhiteSpace(p.Name) &&
+                    p.Name.Equals(targetToken, StringComparison.OrdinalIgnoreCase));
+            }
+
+            // 3) FR name -> internal -> pal
+            if (target == null && palInternalByFr.TryGetValue(targetToken, out var internalFromFr))
+            {
+                target = db.Pals.FirstOrDefault(p =>
+                    p.InternalName.Equals(internalFromFr, StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (target == null)
+            {
+                await FollowupAsync($"❌ Pal inconnu dans la DB: `{targetToken}`");
                 return;
             }
 
@@ -164,20 +189,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 OptionalPassives = new()
             };
 
-            // 4) Solver settings + solve
-            var pruning = PruningRulesBuilder.Default;
-            var settings = CreateBreedingSolverSettings(db, gameSettings, ownedInstances, pruning);
-
-            var solver = new BreedingSolver(settings);
-            var controller = new SolverStateController();
-
-            var results = solver.SolveFor(spec, controller);
-
-            // 5) Prune + pick top
-            var pruner = pruning.BuildAggregate(controller.CancellationToken);
-            var cached = new CachedResultData(results);
-            var pruned = pruner.Apply(results, cached).ToList();
-
             // ✅ labels FR pour l’embed "Passifs requis"
             var frByInternalHeader = LoadPassiveLocFr();
 
@@ -196,12 +207,45 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
+            // 4) Solver settings + solve
+            var pruning = PruningRulesBuilder.Default;
+            var settings = CreateBreedingSolverSettings(db, gameSettings, ownedInstances, pruning);
+
+            var solver = new BreedingSolver(settings);
+            var controller = new SolverStateController();
+
+            var results = solver.SolveFor(spec, controller);
+
+            // ✅ si 0 résultat, on évite le pruning (qui peut throw)
+            if (results.Count == 0)
+            {
+                var header0 = BuildHeader(
+                    playerName, target, target_gender, requiredPassiveLabels,
+                    iv_hp, iv_atk, iv_def,
+                    ownedInstances.Count, rawCount: 0, prunedCount: 0
+                );
+
+                await FollowupAsync(embed: header0);
+                await FollowupAsync("❌ Aucune solution trouvée avec ces paramètres.");
+                return;
+            }
+
+            // 5) Prune + pick top
+            var pruner = pruning.BuildAggregate(controller.CancellationToken);
+            var cached = new CachedResultData(results);
+            var pruned = pruner.Apply(results, cached).ToList();
+
             // 6) Render
-            var header = BuildHeader(playerName, target, target_gender, requiredPassiveLabels, iv_hp, iv_atk, iv_def, ownedInstances.Count, results.Count, pruned.Count);
+            var header = BuildHeader(
+                playerName, target, target_gender, requiredPassiveLabels,
+                iv_hp, iv_atk, iv_def,
+                ownedInstances.Count, results.Count, pruned.Count
+            );
+            await FollowupAsync(embed: header);
 
             if (pruned.Count == 0)
             {
-                await FollowupAsync("😢 Aucune solution après pruning. (Essaie de baisser les contraintes, ou on ajuste les settings.)");
+                await FollowupAsync("⚠️ Aucune solution trouvée après filtrage.)");
                 return;
             }
 
@@ -460,11 +504,11 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         return new EmbedBuilder()
             .WithTitle("PalCalc — Breeding Solver")
             .AddField("Joueur", playerName, inline: true)
-            .AddField("Cible", $"{target.Name ?? target.InternalName} ({genderLabel})", inline: true)
-            .AddField("Passifs requis", passivesLabel, inline: false)
-            .AddField("IV mins", $"HP {Clamp(ivHp)}/100 • ATK {Clamp(ivAtk)}/100 • DEF {Clamp(ivDef)}/100", inline: false)
-            .AddField("Owned", ownedCount.ToString(), inline: true)
-            .AddField("Résultats", $"raw={rawCount} • pruned={prunedCount}", inline: true)
+            .AddField("Pal ciblé", $"{target.Name ?? target.InternalName} ({genderLabel})", inline: true)
+            .AddField("Passifs sélectionnés", passivesLabel, inline: false)
+            .AddField("IV minimums", $"HP {Clamp(ivHp)}/100 • ATK {Clamp(ivAtk)}/100 • DEF {Clamp(ivDef)}/100", inline: false)
+            .AddField("Pals possédés", ownedCount.ToString(), inline: true)
+            .AddField("Résultats", $"Filtrés : {prunedCount} • Brut : {rawCount}", inline: true)
             .WithColor(new Color(88, 101, 242))
             .Build();
     }
@@ -565,9 +609,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
     private static LineNode? FindChild(LineNode n, Func<LineNode, bool> pred)
         => n.Children.FirstOrDefault(pred);
-
-    private static IEnumerable<LineNode> FindChildren(LineNode n, Func<LineNode, bool> pred)
-        => n.Children.Where(pred);
 
     private string PrettyFormatBreedingPlan(string raw)
     {
@@ -716,7 +757,34 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         var ordered = TopoOrderSteps(steps);
 
         if (ordered.Count == 0)
-            return "😶 Aucun step détecté (format renderer inattendu ?)";
+        {
+            // Cas "déjà possédé" : le plan n'a aucun BRED, seulement du OWNED.
+            var ownedCards = pals.Values
+                .Where(c => !string.IsNullOrWhiteSpace(c.Signature) &&
+                            c.Signature.StartsWith("OWNED|", StringComparison.OrdinalIgnoreCase))
+                // dédoublonnage : même Pal = même signature
+                .GroupBy(c => c.Signature, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
+
+            var best = ownedCards.FirstOrDefault();
+            if (best == null)
+                return "⚠️ Aucun step détecté (format renderer inattendu ?)";
+
+            var sb0 = new StringBuilder();
+            sb0.AppendLine("**Aucune reproduction nécessaire**");
+            sb0.AppendLine("Ce Pal correspond déjà aux critères :");
+            sb0.AppendLine();
+
+            var line = string.IsNullOrWhiteSpace(best.HeaderLineNoEggs) ? best.HeaderLine : best.HeaderLineNoEggs;
+            sb0.AppendLine($"{line}");
+
+            if (best.ActualPassives is { Count: > 0 })
+                sb0.AppendLine($"{Indent(1)} {EmojiRealStatic()} Passifs : **{string.Join(", ", best.ActualPassives)}**");
+
+            return sb0.ToString().TrimEnd();
+
+        }
 
         int? totalEggsEstimated = null;
 
@@ -839,9 +907,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             return null;
         }
     }
-
-    // nodeId -> internal key (unique)
-    private readonly Dictionary<int, string> _nodeKey = new();
 
     private sealed class PalCard
     {
@@ -1103,7 +1168,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
     }
 
     private string EmojiReal() => "<:passive_rank_arrow_03:1464196763891138684>";
-    private string EmojiInherit() => "<:passive_rank_arrow_04:1464197339559231572>";
 
     private string LocalizePassiveToken(
         string token,
@@ -1483,27 +1547,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         int n = 0;
         while (n < line.Length && line[n] == ' ') n++;
         return n;
-    }
-
-    private static string TrimDebug(string s, int max)
-    {
-        if (string.IsNullOrEmpty(s)) return s;
-        if (s.Length <= max) return s;
-        return s.Substring(0, max - 1) + "…";
-    }
-
-    private static string DumpNode(LineNode n, int maxDepth = 3, int depth = 0)
-    {
-        var sb = new StringBuilder();
-        void Recurse(LineNode node, int d)
-        {
-            if (d > maxDepth) return;
-            sb.AppendLine($"{new string(' ', d * 2)}[{node.Id}] {node.Text}");
-            foreach (var c in node.Children)
-                Recurse(c, d + 1);
-        }
-        Recurse(n, depth);
-        return sb.ToString().TrimEnd();
     }
 
     private static string StripDiscordEmojis(string input)
