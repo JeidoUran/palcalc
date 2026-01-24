@@ -28,13 +28,13 @@ public static class EmojiNameNormalizer
         // Cas spéciaux
         s = s.Replace("œ", "oe");
 
-        // Garde alphanum + espaces uniquement
-        s = Regex.Replace(s, @"[^a-z0-9 ]", "");
-
-        // Espaces -> underscore
-        s = Regex.Replace(s, @"\s+", "_").Trim('_');
+        // 🔥 VERSION BÉTON
+        // tout ce qui n'est pas [a-z0-9] -> underscore
+        s = Regex.Replace(s, @"[^a-z0-9]+", "_");
+        s = Regex.Replace(s, @"_+", "_").Trim('_');
 
         return s;
     }
+
 }
 

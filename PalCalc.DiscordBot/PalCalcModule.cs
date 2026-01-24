@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Collections.Concurrent;
+using System.IO;
 
 using Discord;
 using Discord.Interactions;
@@ -177,9 +178,26 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             var cached = new CachedResultData(results);
             var pruned = pruner.Apply(results, cached).ToList();
 
+            // ✅ labels FR pour l’embed "Passifs requis"
+            var frByInternalHeader = LoadPassiveLocFr();
+
+            var requiredPassiveLabels = requiredPassives
+                .Select(ps =>
+                {
+                    var internalName = ps.InternalName?.Trim();
+                    if (!string.IsNullOrWhiteSpace(internalName) &&
+                        frByInternalHeader.TryGetValue(internalName, out var fr))
+                        return fr;
+
+                    // fallback : nom EN de la DB, puis internal
+                    return (ps.Name ?? ps.InternalName ?? "").Trim();
+                })
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
             // 6) Render
-            var header = BuildHeader(playerName, target, target_gender, requiredPassiveIds, iv_hp, iv_atk, iv_def, ownedInstances.Count, results.Count, pruned.Count);
-            await FollowupAsync(embed: header);
+            var header = BuildHeader(playerName, target, target_gender, requiredPassiveLabels, iv_hp, iv_atk, iv_def, ownedInstances.Count, results.Count, pruned.Count);
 
             if (pruned.Count == 0)
             {
@@ -203,7 +221,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             var pages = new List<string>();
 
             if (bestPruned != null)
-                pages.Add(RenderPlan(bestPruned, "Solution #1 (prunée)"));
+                pages.Add(RenderPlan(bestPruned, "Solution #1 (filtrée)"));
 
             int addedRaw = 0;
             foreach (var r in rawTop)
@@ -212,12 +230,12 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 if (bestPruned != null && ReferenceEquals(r, bestPruned))
                     continue;
 
-                pages.Add(RenderPlan(r, $"Solution #{pages.Count + 1} (raw)"));
+                pages.Add(RenderPlan(r, $"Solution #{pages.Count + 1}"));
                 addedRaw++;
             }
 
             if (pages.Count == 0 && results.Count > 0)
-                pages.Add(RenderPlan(results[0], "Solution #1 (raw)"));
+                pages.Add(RenderPlan(results[0], "Solution #1"));
 
             var session = new PagerSession
             {
@@ -422,7 +440,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         string playerName,
         Pal target,
         TargetGender gender,
-        List<string> requiredPassiveIds,
+        List<string> requiredPassiveLabels,
         int ivHp, int ivAtk, int ivDef,
         int ownedCount,
         int rawCount,
@@ -435,9 +453,9 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             _ => "Free"
         };
 
-        var passivesLabel = requiredPassiveIds.Count == 0
+        var passivesLabel = requiredPassiveLabels.Count == 0
             ? "—"
-            : string.Join(", ", requiredPassiveIds);
+            : string.Join(", ", requiredPassiveLabels);
 
         return new EmbedBuilder()
             .WithTitle("PalCalc — Breeding Solver")
@@ -561,17 +579,27 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             .ToList();
 
         _passives.TryRefreshIfStale();
-
+        
         var frByInternal = LoadPassiveLocFr();
         var db = PalDB.LoadEmbedded();
         var internalByEnglish = BuildInternalByEnglishName(db);
 
+        var palFrByInternal = LoadPalLocFr();
+        var palInternalByEnglish = BuildInternalByEnglishPalName(db);
+
         var roots = BuildIndentTree(rawLines);
 
         var pals = new Dictionary<string, PalCard>(StringComparer.OrdinalIgnoreCase);
+
+        // nodeId -> palKey
+        var nodeKey = new Dictionary<int, string>();
+        // palKey -> signature (sinon on peut le lire sur pals[palKey].Signature)
+        // (pas strictement nécessaire, mais pratique)
+        // var keySig = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         var steps = new List<BreedStep>();
 
-        // 1) collect all nodes "- OWNED ..." / "- BRED ..." as cards
+        // 1) collect cards
         foreach (var node in Walk(roots))
         {
             var t = node.Text;
@@ -582,53 +610,70 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (t.Contains("OPPOSITE_WILDCARD", StringComparison.OrdinalIgnoreCase) &&
                 t.Contains("candidates=", StringComparison.OrdinalIgnoreCase))
             {
-                // debug spam line, ignore
                 continue;
             }
 
             if (t.StartsWith("- OWNED ", StringComparison.OrdinalIgnoreCase))
             {
-                // ignore wrapper "(COMPOSITE)" own line as a pal card (it is not a real pal instance)
                 if (t.StartsWith("- OWNED (COMPOSITE)", StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 var owned = ParseOwnedLine(t);
+
+                var palDisplay = LocalizePalName(owned.palName, palFrByInternal, palInternalByEnglish);
+
+                // key = brut (pas localisé) + nodeId
                 var key = PalKey(owned.palName, owned.gender, node.Id);
 
                 var loc = LocalizeLocation(owned.location);
-                var header = $"{EmojiForPal(owned.palName)} **{owned.palName}** {FormatGender(owned.gender)}" +
-                             $"{(string.IsNullOrWhiteSpace(loc) ? "" : $" — `{loc}`")}";
+                var header = $"{EmojiForPal(palDisplay)} **{palDisplay}** {FormatGender(owned.gender)}" +
+                            $"{(string.IsNullOrWhiteSpace(loc) ? "" : $" — `{loc}`")}";
 
                 UpsertPalCard(pals, key, header);
+                
+                // ✅ force le label court à utiliser le nom localisé
+                pals[key].ShortLabel = $"{palDisplay}{FormatGender(owned.gender)}";
+
+                // OWNED
+                pals[key].Signature =
+                    $"OWNED|{palDisplay}|{(owned.gender ?? "?").ToUpperInvariant()}|{(owned.location ?? "").Trim()}";
 
                 var actual = ExtractActualFromNode(node, frByInternal, internalByEnglish);
                 if (actual is { Count: > 0 })
                     pals[key].ActualPassives = actual;
 
-                // store node->key mapping for later resolution
-                _nodeKey[node.Id] = key;
+                nodeKey[node.Id] = key;
             }
             else if (t.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
             {
                 var info = ParseBredLine(t);
+
+                var palDisplay = LocalizePalName(info.palName, palFrByInternal, palInternalByEnglish);
                 var key = PalKey(info.palName, info.gender, node.Id);
 
-                var header = $"{EmojiForPal(info.palName)} **{info.palName}** {FormatGender(info.gender)}{FormatBredMeta(info.steps, info.eggs, info.totalEggs)}";
+                var header = $"{EmojiForPal(palDisplay)} **{palDisplay}** {FormatGender(info.gender)}{FormatBredMeta(info.steps, info.eggs, info.totalEggs)}";
                 UpsertPalCard(pals, key, header);
+                pals[key].TotalEggs = info.totalEggs;
+
+                // ✅ force le label court à utiliser le nom localisé
+                pals[key].ShortLabel = $"{palDisplay}{FormatGender(info.gender)}";
+
+                // BRED
+                pals[key].Signature =
+                    $"BRED|{palDisplay}|{(info.gender ?? "?").ToUpperInvariant()}";
 
                 var actual = ExtractActualFromNode(node, frByInternal, internalByEnglish);
                 if (actual is { Count: > 0 })
                     pals[key].ActualPassives = actual;
 
-                _nodeKey[node.Id] = key;
+                nodeKey[node.Id] = key;
             }
         }
 
-        // 2) build steps by reading each "- BRED ..." node's "parents:"
+        // 2) build steps from each BRED node's parents:
         foreach (var bredNode in Walk(roots).Where(n => n.Text.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase)))
         {
-            // output key
-            if (!_nodeKey.TryGetValue(bredNode.Id, out var outKey))
+            if (!nodeKey.TryGetValue(bredNode.Id, out var outKey))
                 continue;
 
             var parentsNode = FindChild(bredNode, c => c.Text.Equals("parents:", StringComparison.OrdinalIgnoreCase));
@@ -636,14 +681,29 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 continue;
 
             var parentKeys = new List<string>(2);
+            var seenSig = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var entry in parentsNode.Children)
             {
-                var resolved = ResolveParentKey(entry);
-                if (resolved == null)
-                    continue;
+                foreach (var candKey in ResolveParentKeys(entry))
+                {
+                    if (string.IsNullOrWhiteSpace(candKey)) continue;
 
-                parentKeys.Add(resolved);
+                    if (!pals.TryGetValue(candKey, out var candCard))
+                        continue;
+
+                    var sig = candCard.Signature ?? candKey;
+
+                    // ✅ évite que COMPOSITE "recompte" le même pal
+                    if (!seenSig.Add(sig))
+                        continue;
+
+                    parentKeys.Add(candKey);
+
+                    if (parentKeys.Count == 2)
+                        break;
+                }
+
                 if (parentKeys.Count == 2)
                     break;
             }
@@ -652,15 +712,30 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 steps.Add(new BreedStep(parentKeys[0], parentKeys[1], outKey));
         }
 
-        // 3) order steps ingredients -> target
+        // 3) order
         var ordered = TopoOrderSteps(steps);
 
         if (ordered.Count == 0)
             return "😶 Aucun step détecté (format renderer inattendu ?)";
 
+        int? totalEggsEstimated = null;
+
+        var finalStep = ordered.LastOrDefault();
+        if (finalStep != null && pals.TryGetValue(finalStep.OutputKey, out var finalCard))
+            totalEggsEstimated = finalCard.TotalEggs;
+
         // 4) render
         var sb = new StringBuilder();
-        sb.AppendLine("**Étapes (ingrédients → cible)**");
+        if (totalEggsEstimated.HasValue)
+        {
+            sb.AppendLine(
+                $"**Étapes • ~{totalEggsEstimated.Value} <:egg:1464196335430402122> totaux estimés**"
+            );
+        }
+        else
+        {
+            sb.AppendLine("**Étapes (ingrédients → cible)**");
+        }
         sb.AppendLine();
 
         var producedAt = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -678,7 +753,15 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             var outCard = pals.TryGetValue(st.OutputKey, out var oc) ? oc : null;
             var outLabel = outCard?.ShortLabel ?? st.OutputKey;
 
-            sb.AppendLine($"{Indent(1)}**= {pals[st.ParentAKey].ShortLabel} + {pals[st.ParentBKey].ShortLabel} → {outLabel}**");
+            var a = pals[st.ParentAKey];
+            var b = pals[st.ParentBKey];
+            var o = pals[st.OutputKey];
+
+            sb.AppendLine(
+                $"{Indent(1)}**= {a.HeaderLine.Split(' ')[0]} {a.ShortLabel} " +
+                $"+ {b.HeaderLine.Split(' ')[0]} {b.ShortLabel} " +
+                $"→ {o.HeaderLine.Split(' ')[0]} {o.ShortLabel}**"
+            );
 
             producedAt[st.OutputKey] = stepNo;
 
@@ -694,53 +777,48 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
         return sb.ToString().TrimEnd();
 
-        // -------- local helpers (tree based) --------
+        // -------- local helpers --------
 
-        string? ResolveParentKey(LineNode entry)
+        IEnumerable<string> ResolveParentKeys(LineNode entry)
         {
-            // parent entry can be:
-            // - OWNED ...
-            // - BRED ...
-            // - OWNED (COMPOSITE) ...  -> pick first real child OWNED/BRED
             var t = entry.Text;
 
+            // composite wrapper: return ALL real candidates inside (pas juste le 1er)
             if (t.StartsWith("- OWNED (COMPOSITE)", StringComparison.OrdinalIgnoreCase) ||
                 t.Contains("(COMPOSITE)", StringComparison.OrdinalIgnoreCase))
             {
-                // descend: find first descendant that is a real OWNED/BRED (NOT composite)
                 foreach (var d in Walk(entry))
                 {
                     if (d.Id == entry.Id) continue;
 
                     var dt = d.Text;
+
                     if (dt.StartsWith("- OWNED (COMPOSITE)", StringComparison.OrdinalIgnoreCase))
                         continue;
 
                     if (dt.StartsWith("- OWNED ", StringComparison.OrdinalIgnoreCase) ||
                         dt.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
                     {
-                        if (_nodeKey.TryGetValue(d.Id, out var k))
-                            return k;
+                        if (nodeKey.TryGetValue(d.Id, out var k))
+                            yield return k;
                     }
                 }
 
-                return null;
+                yield break;
             }
 
             if (t.StartsWith("- OWNED ", StringComparison.OrdinalIgnoreCase) ||
                 t.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
             {
-                return _nodeKey.TryGetValue(entry.Id, out var k) ? k : null;
+                if (nodeKey.TryGetValue(entry.Id, out var k))
+                    yield return k;
             }
-
-            return null;
         }
 
         List<string>? ExtractActualFromNode(LineNode n,
             Dictionary<string, string> frByInternal2,
             Dictionary<string, string> internalByEnglish2)
         {
-            // actual line is usually a child like: "actual : Diamond Body"
             foreach (var c in n.Children)
             {
                 var tx = c.Text;
@@ -752,12 +830,10 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 if (string.IsNullOrWhiteSpace(val))
                     return null;
 
-                var tokens = val.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                return val.Split(',', StringSplitOptions.RemoveEmptyEntries)
                     .Select(x => x.Trim())
                     .Select(x => LocalizePassiveToken(x, frByInternal2, internalByEnglish2))
                     .ToList();
-
-                return tokens;
             }
 
             return null;
@@ -773,6 +849,9 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         public string ShortLabel { get; set; } = "";
         public List<string>? ActualPassives { get; set; }
         public string? HeaderLineRawWithoutEmoji { get; set; }
+        public string Signature { get; set; } = "";
+        public int? TotalEggs { get; set; }
+        public string HeaderLineNoEggs { get; set; } = "";
     }
 
     private sealed record BreedStep(string ParentAKey, string ParentBKey, string OutputKey);
@@ -794,17 +873,37 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         }
 
         card.HeaderLine = header;
+
+        // 1) retire juste la partie "~X <:egg:...> estimés" (avec OU sans "•" avant)
+        var noEggs = Regex.Replace(
+            header,
+            @"(?:\s*•\s*)?~\d+\s*<:egg:\d+>\s*estimés",
+            "",
+            RegexOptions.IgnoreCase
+        );
+
+        // 2) nettoie les séparateurs "•" restants dans les parenthèses (début/fin)
+        noEggs = Regex.Replace(noEggs, @"\(\s*•\s*", "(", RegexOptions.IgnoreCase);
+        noEggs = Regex.Replace(noEggs, @"\s*•\s*\)", ")", RegexOptions.IgnoreCase);
+
+        // 3) compact les espaces dans les parenthèses
+        noEggs = Regex.Replace(noEggs, @"\(\s*", "(", RegexOptions.IgnoreCase);
+        noEggs = Regex.Replace(noEggs, @"\s*\)", ")", RegexOptions.IgnoreCase);
+
+        // 4) si on a "(...)" devenu vide, on enlève complètement
+        noEggs = Regex.Replace(noEggs, @"\(\s*\)", "", RegexOptions.IgnoreCase);
+
+        card.HeaderLineNoEggs = noEggs.Trim();
+
         card.ShortLabel = shortLabel;
         card.HeaderLineRawWithoutEmoji = header;
+
     }
 
     private static string FormatBredMeta(int? steps, int? eggs, int? totalEggs)
     {
         var bits = new List<string>();
-
-        if (steps.HasValue) bits.Add($"{steps.Value} attempt(s)");
-        if (eggs.HasValue) bits.Add($"~{eggs.Value}<:egg:1464196335430402122>");
-        if (totalEggs.HasValue) bits.Add($"total ~{totalEggs.Value}<:egg:1464196335430402122>");
+        if (eggs.HasValue) bits.Add($"~{eggs.Value} <:egg:1464196335430402122> estimés");
 
         return bits.Count == 0 ? "" : $"  ({string.Join(" • ", bits)})";
     }
@@ -870,7 +969,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
     {
         if (!pals.TryGetValue(key, out var card))
         {
-            sb.AppendLine($"{Indent(indentLevel)}• {key}");
+            sb.AppendLine($"{Indent(indentLevel)}{key}");
             return;
         }
 
@@ -878,10 +977,12 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             ? $" _(résultat étape {stepNo})_"
             : "";
 
-        sb.AppendLine($"{Indent(indentLevel)}- {card.HeaderLine}{producedHint}");
+        var headerToPrint = producedAt.ContainsKey(key) ? card.HeaderLineNoEggs : card.HeaderLine;
+        sb.AppendLine($"{Indent(indentLevel)}{headerToPrint}{producedHint}");
 
+        // petit espace pour aligner l’emoji passifs avec l’emoji pal
         if (card.ActualPassives is { Count: > 0 })
-            sb.AppendLine($"{Indent(indentLevel + 1)}{EmojiRealStatic()} Passifs : **{string.Join(", ", card.ActualPassives)}**");
+            sb.AppendLine($"{Indent(indentLevel + 1)} {EmojiRealStatic()} Passifs : **{string.Join(", ", card.ActualPassives)}**");
     }
 
     private static string Indent(int level) => new string(' ', level * 2);
@@ -895,8 +996,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         {
             "MALE" => " ♂",
             "FEMALE" => " ♀",
-            "WILDCARD" => " 🔀",
-            "OPPOSITE_WILDCARD" => " 🔁",
+            "WILDCARD" => " ⚥",
+            "OPPOSITE_WILDCARD" => " ⇄",
             _ => $" ({g})"
         };
     }
@@ -1084,12 +1185,13 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         s = s.Replace("DimensionalPalStorage", "Stockage dimensionnel", StringComparison.OrdinalIgnoreCase);
         s = s.Replace("Dimensional Pal Storage", "Stockage dimensionnel", StringComparison.OrdinalIgnoreCase);
         s = s.Replace("GlobalPalBox", "Boîte à Pals globale", StringComparison.OrdinalIgnoreCase);
-        s = s.Replace("Party", "Équipe", StringComparison.OrdinalIgnoreCase);
+        s = s.Replace("PlayerParty", "Équipe", StringComparison.OrdinalIgnoreCase);
 
         s = s.Replace("Palbox", "Boîte à Pals", StringComparison.OrdinalIgnoreCase);
         s = s.Replace("MarketStall", "Marché aux puces", StringComparison.OrdinalIgnoreCase);
 
         s = Regex.Replace(s, @"\s+Onglet\s+", ", Onglet ", RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, @"\s+Slot\s+", ", Slot ", RegexOptions.IgnoreCase);
         return s;
     }
 
@@ -1129,12 +1231,13 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             .Build();
     }
 
-    private static MessageComponent BuildPagerComponents(string key)
+    private static MessageComponent BuildPagerComponents(string key, bool disabled = false)
     {
         var cb = new ComponentBuilder()
-            .WithButton("◀", $"palcalc:prev:{key}", ButtonStyle.Secondary)
-            .WithButton("▶", $"palcalc:next:{key}", ButtonStyle.Secondary)
-            .WithButton("Fermer", $"palcalc:close:{key}", ButtonStyle.Danger);
+            .WithButton("◀", $"palcalc:prev:{key}", ButtonStyle.Secondary, disabled: disabled)
+            .WithButton("▶", $"palcalc:next:{key}", ButtonStyle.Secondary, disabled: disabled)
+            .WithButton("Copier", $"palcalc:copy:{key}", ButtonStyle.Primary, disabled: disabled)
+            .WithButton("Fermer", $"palcalc:close:{key}", ButtonStyle.Danger, disabled: disabled);
 
         return cb.Build();
     }
@@ -1192,6 +1295,57 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         await ModifyPagerMessageAsync(sess, pagerKey);
     }
 
+    [ComponentInteraction("palcalc:copy:*")]
+    public async Task PagerCopyAsync(string pagerKey)
+    {
+        // réponse éphémère (sinon ça spam le channel)
+        await DeferAsync(ephemeral: true);
+
+        if (!_pager.TryGetValue(pagerKey, out var sess))
+            return;
+
+        if (IsExpired(sess))
+        {
+            _pager.TryRemove(pagerKey, out _);
+            await FollowupAsync("⏳ Session expirée.", ephemeral: true);
+            return;
+        }
+
+        if (Context.User.Id != sess.OwnerUserId)
+        {
+            await FollowupAsync("Pas ta session 🙂", ephemeral: true);
+            return;
+        }
+
+        var idx = sess.Index;
+        var text = sess.Pages[idx]; // <- IMPORTANT : on prend la version “originale”, pas celle avec NBSP
+        // Nettoyage pour le clipboard
+        text = Regex.Replace(
+            text,
+            @"(?<=\d)\s*<:egg:\d+>",
+            " œuf(s)"
+        );
+        text = StripDiscordEmojis(text);
+        text = text.Replace('\u00A0', ' '); // NBSP -> espace normal (bonus)
+
+        // Si ça rentre, on envoie un bloc de code (Discord affiche un bouton copier)
+        // (on garde une marge pour ```\n...\n``` + texte autour)
+        const int safeLimit = 1800;
+
+        if (text.Length <= safeLimit)
+        {
+            await FollowupAsync($"```text\n{text}\n```", ephemeral: true);
+            return;
+        }
+
+        // Sinon: fichier .txt (copiable sans limite)
+        var fileName = $"palcalc-solution-{idx + 1}.txt";
+        var bytes = Encoding.UTF8.GetBytes(text);
+
+        using var ms = new MemoryStream(bytes);
+        await FollowupWithFileAsync(ms, fileName, "📄 Trop long pour Discord en message — je te le mets en fichier .txt", ephemeral: true);
+    }
+
     [ComponentInteraction("palcalc:close:*")]
     public async Task PagerCloseAsync(string pagerKey)
     {
@@ -1207,7 +1361,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         }
 
         _pager.TryRemove(pagerKey, out _);
-        await ModifyPagerMessageAsync(sess, pagerKey, content: "✅ Fermé.", close: true);
+
+        await ModifyPagerMessageAsync(sess, pagerKey, close: true);
     }
 
     private async Task<IUserMessage?> GetPagerMessageAsync(PagerSession sess)
@@ -1219,7 +1374,11 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         return m as IUserMessage;
     }
 
-    private async Task<bool> ModifyPagerMessageAsync(PagerSession sess, string pagerKey, string? content = null, bool close = false)
+    private async Task<bool> ModifyPagerMessageAsync(
+        PagerSession sess,
+        string pagerKey,
+        string? content = null,
+        bool close = false)
     {
         var msg = await GetPagerMessageAsync(sess);
         if (msg == null) return false;
@@ -1227,10 +1386,11 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         await msg.ModifyAsync(m =>
         {
             m.Content = content;
-            m.Embeds = close
-                ? new[] { sess.Header }
-                : new[] { sess.Header, BuildSolutionEmbed(sess) };
 
+            // ✅ on garde TOUJOURS les embeds
+            m.Embeds = new[] { sess.Header, BuildSolutionEmbed(sess) };
+
+            // ✅ boutons supprimés si close
             m.Components = close
                 ? new ComponentBuilder().Build()
                 : BuildPagerComponents(pagerKey);
@@ -1238,6 +1398,74 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
         return true;
     }
+
+    private Dictionary<string, string> LoadPalLocFr()
+    {
+        var path = _cfg["PalCalc:LocalizationFile"] ?? "localization.fr.json";
+
+        try
+        {
+            var json = File.ReadAllText(path, Encoding.UTF8);
+            using var doc = JsonDocument.Parse(json);
+
+            if (!doc.RootElement.TryGetProperty("pals", out var palsEl) ||
+                palsEl.ValueKind != JsonValueKind.Object)
+                return new(StringComparer.OrdinalIgnoreCase);
+
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var prop in palsEl.EnumerateObject())
+            {
+                var key = prop.Name;
+                var val = prop.Value.GetString();
+                if (!string.IsNullOrWhiteSpace(key) && !string.IsNullOrWhiteSpace(val))
+                    dict[key] = val.Trim();
+            }
+            return dict;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Failed to load pals localization from {Path}", path);
+            return new(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static Dictionary<string, string> BuildInternalByEnglishPalName(PalDB db)
+    {
+        // map "Illuminant Slime" -> "YakushimaMonster001_Pink"
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var p in db.Pals)
+        {
+            var en = (p.Name ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(en) || string.IsNullOrWhiteSpace(p.InternalName))
+                continue;
+
+            if (!dict.ContainsKey(en))
+                dict[en] = p.InternalName;
+        }
+
+        return dict;
+    }
+
+    private static string LocalizePalName(
+        string nameFromRenderer,
+        Dictionary<string, string> frByInternalPal,
+        Dictionary<string, string> internalByEnglishPal)
+    {
+        var token = nameFromRenderer.Trim();
+
+        // si le renderer donne déjà un InternalName
+        if (frByInternalPal.TryGetValue(token, out var fr1))
+            return fr1;
+
+        // si le renderer donne un nom anglais lisible
+        if (internalByEnglishPal.TryGetValue(token, out var internalKey) &&
+            frByInternalPal.TryGetValue(internalKey, out var fr2))
+            return fr2;
+
+        return token;
+    }
+
 
     private static string PreserveIndentForEmbed(string s)
     {
@@ -1256,4 +1484,39 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         while (n < line.Length && line[n] == ' ') n++;
         return n;
     }
+
+    private static string TrimDebug(string s, int max)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        if (s.Length <= max) return s;
+        return s.Substring(0, max - 1) + "…";
+    }
+
+    private static string DumpNode(LineNode n, int maxDepth = 3, int depth = 0)
+    {
+        var sb = new StringBuilder();
+        void Recurse(LineNode node, int d)
+        {
+            if (d > maxDepth) return;
+            sb.AppendLine($"{new string(' ', d * 2)}[{node.Id}] {node.Text}");
+            foreach (var c in node.Children)
+                Recurse(c, d + 1);
+        }
+        Recurse(n, depth);
+        return sb.ToString().TrimEnd();
+    }
+
+    private static string StripDiscordEmojis(string input)
+    {
+        if (string.IsNullOrEmpty(input)) return input;
+
+        // Supprime <:name:id> et <a:name:id>
+        return Regex.Replace(
+            input,
+            @"<a?:[a-zA-Z0-9_]+:\d+>",
+            "",
+            RegexOptions.Compiled
+        );
+    }
+
 }
