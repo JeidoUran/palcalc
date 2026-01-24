@@ -14,6 +14,9 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
+        Console.SetOut(new ConsoleSpamFilterWriter(Console.Out));
+        Console.SetError(new ConsoleSpamFilterWriter(Console.Error));
+
         var projectRoot = FindProjectRoot();
 
         using var host = Host.CreateDefaultBuilder(args)
