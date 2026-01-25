@@ -517,7 +517,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
     // Rendering / helpers
     // =========================
 
-    private static Embed BuildHeader(
+    private Embed BuildHeader(
         string playerName,
         Pal target,
         TargetGender gender,
@@ -529,19 +529,22 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
     {
         string genderLabel = gender switch
         {
-            TargetGender.Male => "Male",
-            TargetGender.Female => "Female",
-            _ => "Free"
+            TargetGender.Male => "Mâle",
+            TargetGender.Female => "Femelle",
+            _ => "Libre"
         };
 
         var passivesLabel = requiredPassiveLabels.Count == 0
             ? "—"
             : string.Join(", ", requiredPassiveLabels);
 
+        var targetLabel = (target.Name ?? target.InternalName)?.Trim() ?? "Unknown";
+        var palEmoji = EmojiForPal(targetLabel);
+
         return new EmbedBuilder()
             .WithTitle("PalCalc — Breeding Solver")
             .AddField("Joueur", playerName, inline: true)
-            .AddField("Pal ciblé", $"{target.Name ?? target.InternalName} ({genderLabel})", inline: true)
+            .AddField("Pal ciblé", $"{palEmoji} {targetLabel} ({genderLabel})", inline: true)
             .AddField("Passifs sélectionnés", passivesLabel, inline: false)
             .AddField("IV minimums", $"HP {Clamp(ivHp)}/100 • ATK {Clamp(ivAtk)}/100 • DEF {Clamp(ivDef)}/100", inline: false)
             .AddField("Pals possédés", ownedCount.ToString(), inline: true)
