@@ -241,7 +241,6 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 iv_hp, iv_atk, iv_def,
                 ownedInstances.Count, results.Count, pruned.Count
             );
-            await FollowupAsync(embed: header);
 
             if (pruned.Count == 0)
             {
@@ -295,6 +294,9 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 embeds: new[] { session.Header, firstSolution },
                 components: BuildPagerComponents("TEMP")
             );
+
+            // ✅ si la 1re page dépasse l’embed, on push direct le .txt (éphémère)
+            await MaybeSendTxtForCurrentPageAsync(session, session.Index);
 
             var pagerKey = msg.Id.ToString();
 
@@ -549,7 +551,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             .AddField("IV minimums", $"HP {Clamp(ivHp)}/100 • ATK {Clamp(ivAtk)}/100 • DEF {Clamp(ivDef)}/100", inline: false)
             .AddField("Pals possédés", ownedCount.ToString(), inline: true)
             .AddField("Résultats", $"Filtrés : {prunedCount} • Brut : {rawCount}", inline: true)
-            .WithColor(new Color(88, 101, 242))
+            .WithColor(new Color(0, 255, 255)) // cyan
             .Build();
     }
 
@@ -723,6 +725,10 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 if (actual is { Count: > 0 })
                     pals[key].ActualPassives = actual;
 
+                var target = ExtractTargetFromNode(node, frByInternal, internalByEnglish);
+                if (target is { Count: > 0 })
+                    pals[key].TargetPassives = target;
+
                 nodeKey[node.Id] = key;
             }
             else if (t.StartsWith("- BRED ", StringComparison.OrdinalIgnoreCase))
@@ -746,6 +752,10 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
                 var actual = ExtractActualFromNode(node, frByInternal, internalByEnglish);
                 if (actual is { Count: > 0 })
                     pals[key].ActualPassives = actual;
+
+                var target = ExtractTargetFromNode(node, frByInternal, internalByEnglish);
+                if (target is { Count: > 0 })
+                    pals[key].TargetPassives = target;
 
                 nodeKey[node.Id] = key;
             }
@@ -876,10 +886,10 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (outCard != null)
             {
                 sb.AppendLine($"{Indent(1)}{outCard.HeaderLineRawWithoutEmoji ?? outCard.HeaderLine}");
-                if (outCard.ActualPassives is { Count: > 0 })
-                    sb.AppendLine($"{Indent(2)}{EmojiReal()} Passifs : **{string.Join(", ", outCard.ActualPassives)}**");
-            }
 
+                if (outCard.TargetPassives is { Count: > 0 })
+                    sb.AppendLine($"{Indent(2)}🎯 Requis : **{string.Join(", ", outCard.TargetPassives)}**");
+            }
             sb.AppendLine();
         }
 
@@ -948,11 +958,37 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         }
     }
 
+    List<string>? ExtractTargetFromNode(LineNode n,
+        Dictionary<string, string> frByInternal2,
+        Dictionary<string, string> internalByEnglish2)
+    {
+        foreach (var c in n.Children)
+        {
+            var tx = c.Text;
+            if (!tx.StartsWith("target", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var idx = tx.IndexOf(':');
+            var val = (idx >= 0 ? tx[(idx + 1)..] : "").Trim();
+            if (string.IsNullOrWhiteSpace(val))
+                return null;
+
+            // On laisse "🎲 aléatoire xN" tel quel si présent.
+            return val.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(x => x.Trim())
+                .Select(x => LocalizePassiveToken(x, frByInternal2, internalByEnglish2))
+                .ToList();
+        }
+
+        return null;
+    }
+
     private sealed class PalCard
     {
         public string HeaderLine { get; set; } = "";
         public string ShortLabel { get; set; } = "";
         public List<string>? ActualPassives { get; set; }
+        public List<string>? TargetPassives { get; set; }
         public string? HeaderLineRawWithoutEmoji { get; set; }
         public string Signature { get; set; } = "";
         public int? TotalEggs { get; set; }
@@ -1313,6 +1349,9 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         public Embed Header { get; init; } = default!;
         public List<string> Pages { get; init; } = new();
         public int Index { get; set; }
+
+        // ✅ évite de renvoyer 15 fois le même .txt si on navigue
+        public HashSet<int> FileSentForPage { get; } = new();
     }
 
     private static readonly ConcurrentDictionary<string, PagerSession> _pager = new();
@@ -1329,11 +1368,22 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
     {
         var idx = sess.Index;
         var title = $"Solution {idx + 1}/{sess.Pages.Count}";
-        return new EmbedBuilder()
+
+        var original = sess.Pages[idx];
+        var formatted = PreserveIndentForEmbed(original);
+
+        var tooLong = formatted.Length > EmbedSafeLimit;
+        var desc = tooLong ? TruncateForEmbed(formatted, EmbedSafeLimit) : formatted;
+
+        var eb = new EmbedBuilder()
             .WithTitle(title)
-            .WithDescription(TruncateForEmbed(PreserveIndentForEmbed(sess.Pages[idx])))
-            .WithColor(new Color(88, 101, 242))
-            .Build();
+            .WithDescription(desc)
+            .WithColor(new Color(88, 101, 242));
+
+        if (tooLong)
+            eb.WithFooter("⚠️ Aperçu tronqué dû aux limites de Discord — version complète envoyée en .txt (éphémère)");
+
+        return eb.Build();
     }
 
     private static MessageComponent BuildPagerComponents(string key, bool disabled = false)
@@ -1373,6 +1423,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
         sess.Index = (sess.Index - 1 + sess.Pages.Count) % sess.Pages.Count;
         await ModifyPagerMessageAsync(sess, pagerKey);
+        // ✅ si la page affichée dépasse, on envoie le .txt (une seule fois)
+        await MaybeSendTxtForCurrentPageAsync(sess, sess.Index);
     }
 
     [ComponentInteraction("palcalc:next:*")]
@@ -1398,6 +1450,8 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
         sess.Index = (sess.Index + 1) % sess.Pages.Count;
         await ModifyPagerMessageAsync(sess, pagerKey);
+        // ✅ si la page affichée dépasse, on envoie le .txt (une seule fois)
+        await MaybeSendTxtForCurrentPageAsync(sess, sess.Index);
     }
 
     [ComponentInteraction("palcalc:copy:*")]
@@ -1448,7 +1502,7 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         var bytes = Encoding.UTF8.GetBytes(text);
 
         using var ms = new MemoryStream(bytes);
-        await FollowupWithFileAsync(ms, fileName, "📄 Trop long pour Discord en message — je te le mets en fichier .txt", ephemeral: true);
+        await FollowupWithFileAsync(ms, fileName, "📄 L'affichage de ce message dépasse la limite autorisée par Discord — veuillez utiliser ce fichier .txt à la place", ephemeral: true);
     }
 
     [ComponentInteraction("palcalc:close:*")]
@@ -1601,6 +1655,42 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             @"<a?:[a-zA-Z0-9_]+:\d+>",
             "",
             RegexOptions.Compiled
+        );
+    }
+
+    private const int EmbedSafeLimit = 3800; // tu utilises déjà ça
+    private const int EphemeralTextSafeLimit = 1800; // ton safeLimit actuel
+
+    private string BuildClipboardFriendlyText(string text)
+    {
+        // Même nettoyage que PagerCopyAsync
+        text = Regex.Replace(text, @"(?<=\d)\s*<:egg:\d+>", " œuf(s)");
+        text = StripDiscordEmojis(text);
+        text = text.Replace('\u00A0', ' ');
+        return text.Trim();
+    }
+
+    private async Task MaybeSendTxtForCurrentPageAsync(PagerSession sess, int pageIndex, string? reason = null)
+    {
+        // On se base sur la version qui va en embed (NBSP inclus) pour décider si ça dépasse
+        var formattedForEmbed = PreserveIndentForEmbed(sess.Pages[pageIndex]);
+        var tooLongForEmbed = formattedForEmbed.Length > EmbedSafeLimit;
+
+        if (!tooLongForEmbed) return;
+
+        // évite renvoi multiple
+        if (!sess.FileSentForPage.Add(pageIndex)) return;
+
+        var text = BuildClipboardFriendlyText(sess.Pages[pageIndex]);
+        var fileName = $"palcalc-solution-{pageIndex + 1}.txt";
+        var bytes = Encoding.UTF8.GetBytes(text);
+
+        using var ms = new MemoryStream(bytes);
+        await FollowupWithFileAsync(
+            ms,
+            fileName,
+            reason ?? "📄 L'affichage de cette solution dépasse la limite autorisée par Discord pour les embeds — veuillez utiliser ce fichier .txt à la place",
+            ephemeral: true
         );
     }
 

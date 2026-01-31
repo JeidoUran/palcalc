@@ -13,16 +13,14 @@ public static class BreedingPlanRenderer
             {
                 Console.WriteLine($"{indent}- OWNED {o.Pal.Name} {o.Gender} [{FormatPalLocation(o.UnderlyingInstance.Location)}]");
 
-                var eff = (o.EffectivePassives.Count == 0)
-                    ? "Aucun passif"
-                    : string.Join(", ", o.EffectivePassives.Select(p => p.Name));
+                var target = FormatTargetPassives(o.EffectivePassives);
 
                 var actualList = o.ActualPassives ?? o.UnderlyingInstance?.PassiveSkills;
                 var actual = (actualList == null || actualList.Count == 0)
-                    ? "Aucun passif"
+                    ? "Aucun"
                     : string.Join(", ", actualList.Select(p => p.Name));
 
-                Console.WriteLine($"{indent}    eff    : {eff}");
+                Console.WriteLine($"{indent}    target : {target}");
                 Console.WriteLine($"{indent}    actual : {actual}");
                 return;
             }
@@ -30,11 +28,20 @@ public static class BreedingPlanRenderer
             case BredPalReference b:
             {
                 Console.WriteLine($"{indent}- BRED {b.Pal.Name} {b.Gender} steps={b.NumTotalBreedingSteps} eggs~{b.AvgRequiredBreedings} totalEggs~{b.NumTotalEggs}");
-                Console.WriteLine($"{indent}    passives: {(b.EffectivePassives.Count == 0 ? "none" : string.Join(", ", b.EffectivePassives.Select(p => p.Name)))}");
+
+                var target = FormatTargetPassives(b.EffectivePassives);
+                Console.WriteLine($"{indent}    target : {target}");
+
+                // optionnel : si tu veux afficher "actual" quand dispo
+                var actualList = b.ActualPassives;
+                if (actualList != null && actualList.Count > 0)
+                    Console.WriteLine($"{indent}    actual : {string.Join(", ", actualList.Select(p => p.Name))}");
+
                 Console.WriteLine($"{indent}    parents:");
                 Print(b.Parent1, indent + "        ");
                 Print(b.Parent2, indent + "        ");
                 return;
+
             }
 
             default:
@@ -136,6 +143,27 @@ public static class BreedingPlanRenderer
             if (!string.IsNullOrWhiteSpace(n)) names.Add(n!);
         }
         return names.Count == 0 ? null : string.Join(", ", names);
+    }
+
+    static string FormatTargetPassives(IEnumerable<PassiveSkill> passives)
+    {
+        if (passives == null) return "Aucun";
+
+        int random = 0;
+        var named = new List<string>();
+
+        foreach (var p in passives)
+        {
+            if (p is RandomPassiveSkill) random++;
+            else if (!string.IsNullOrWhiteSpace(p.Name)) named.Add(p.Name);
+            else named.Add(p.ToString() ?? "?");
+        }
+
+        if (named.Count == 0 && random == 0) return "Aucun";
+        if (named.Count == 0) return $"🎲 aléatoire x{random}";
+        return random > 0
+            ? $"{string.Join(", ", named)} + 🎲 x{random}"
+            : string.Join(", ", named);
     }
 
     static string FormatPalLocation(PalLocation loc)
