@@ -65,8 +65,25 @@ public static class SolverMapping
             if (string.IsNullOrWhiteSpace(e.characterId)) continue;
             if (string.Equals(e.characterId, "None", StringComparison.OrdinalIgnoreCase)) continue;
 
-            if (!palsByInternal.TryGetValue(e.characterId, out var pal))
-                continue;
+            var cid = e.characterId.Trim();
+
+            // 1) tentative directe
+            if (!palsByInternal.TryGetValue(cid, out var pal))
+            {
+                // 2) fallback : strip des préfixes type BOSS_
+                var normalized = NormalizePalInternalName(cid);
+
+                if (!string.Equals(normalized, cid, StringComparison.OrdinalIgnoreCase) &&
+                    palsByInternal.TryGetValue(normalized, out pal))
+                {
+                    cid = normalized; // (optionnel) si tu veux conserver l’id normalisé
+                }
+                else
+                {
+                    continue;
+                }
+            }
+
 
             var gender = ParseGender(e.gender);
 
@@ -150,6 +167,27 @@ public static class SolverMapping
                 _ => LocationType.Custom
             }
         };
+    }
+
+    private static string NormalizePalInternalName(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return raw;
+        raw = raw.Trim();
+
+        // Préfixes connus (ordre important si un jour t’en as plusieurs)
+        // Ajoute-en ici si besoin: "RAID_", "EVENT_", etc.
+        ReadOnlySpan<string> prefixes = new[]
+        {
+            "BOSS_"
+        };
+
+        foreach (var p in prefixes)
+        {
+            if (raw.StartsWith(p, StringComparison.OrdinalIgnoreCase))
+                return raw.Substring(p.Length);
+        }
+
+        return raw;
     }
 
 }
