@@ -785,9 +785,12 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
 
                     var sig = candCard.Signature ?? candKey;
 
-                    // ✅ évite que COMPOSITE "recompte" le même pal
-                    if (!seenSig.Add(sig))
-                        continue;
+                    // on dédoublonne uniquement les OWNED (même pal réel = même emplacement)
+                    if (sig.StartsWith("OWNED|", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!seenSig.Add(sig))
+                            continue;
+                    }
 
                     parentKeys.Add(candKey);
 
@@ -973,11 +976,24 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
             if (string.IsNullOrWhiteSpace(val))
                 return null;
 
-            // On laisse "🎲 aléatoire xN" tel quel si présent.
-            return val.Split(',', StringSplitOptions.RemoveEmptyEntries)
+            // capture " + 🎲 xN" si présent
+            var m = Regex.Match(val, @"\+\s*🎲\s*x(\d+)\s*$", RegexOptions.IgnoreCase);
+            int randomCount = 0;
+            if (m.Success && int.TryParse(m.Groups[1].Value, out var rc))
+            {
+                randomCount = rc;
+                val = val[..m.Index].Trim(); // retire le suffixe
+            }
+
+            var list = val.Split(',', StringSplitOptions.RemoveEmptyEntries)
                 .Select(x => x.Trim())
                 .Select(x => LocalizePassiveToken(x, frByInternal2, internalByEnglish2))
                 .ToList();
+
+            if (randomCount > 0)
+                list.Add($"🎲 aléatoire x{randomCount}");
+
+            return list;
         }
 
         return null;
@@ -1255,9 +1271,11 @@ public sealed class PalCalcModule : InteractionModuleBase<SocketInteractionConte
         if (token.Equals("(Random)", StringComparison.OrdinalIgnoreCase))
             return "🎲 aléatoire";
 
-        if (frByInternal.TryGetValue(token, out var fr1))
-            return fr1;
+        // 1) token = internal direct
+        if (frByInternal.TryGetValue(token, out var fr))
+            return fr;
 
+        // 2) fallback: token = english label -> internal -> fr
         if (internalByEnglish.TryGetValue(token, out var internalKey) &&
             frByInternal.TryGetValue(internalKey, out var fr2))
             return fr2;
